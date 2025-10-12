@@ -3,6 +3,7 @@ import {
 	BattleRuleset,
 	BattleState,
 	Category,
+	AnimationEvent,
 	LogSink,
 	Move,
 	MoveAction,
@@ -17,6 +18,7 @@ import {
 	import { calcDamage, chooseDefenseStat } from "./damage";
 	import { Abilities } from "./data/abilities";
 	import { Items } from "./data/items";
+import { typeEffectiveness } from "./data/type-chart";
 
 type Handler<T extends any[]> = (...args: T) => void;
 
@@ -49,15 +51,42 @@ export class Engine implements BattleRuleset {
 		// Trigger switch-in handlers for initial actives
 		for (const p of this.state.players) {
 			const active = p.team[p.activeIndex];
+			// Initialize PP store per mon
+			(active as any).volatile = (active as any).volatile || {};
+			(active as any).volatile.pp = (active as any).volatile.pp || {};
 			this.emitSwitchIn(active);
 		}
 		return this.state;
+	}
+
+	// Allow the server to perform a forced switch outside of a normal turn.
+	// Does not advance the turn or process end-of-turn effects.
+	forceSwitch(playerId: string, toIndex: number): { state: BattleState; events: string[]; anim: AnimationEvent[] } {
+		if (!this.state) throw new Error("Engine not initialized");
+		const events: string[] = [];
+		const anim: AnimationEvent[] = [];
+		const log: LogSink = (msg) => {
+			this.state.log.push(msg);
+			events.push(msg);
+		};
+		const player = this.state.players.find((p) => p.id === playerId);
+		if (!player) throw new Error("player not found");
+		const idx = Math.max(0, Math.min(player.team.length - 1, toIndex));
+		player.activeIndex = idx;
+		const active = player.team[player.activeIndex];
+		log(`${player.name} switched to ${active.name}!`);
+		this.emitSwitchIn(active, log);
+		anim.push({ type: "switch", payload: { playerId: player.id, pokemonId: active.id } });
+		return { state: this.state, events, anim };
 	}
 
 	processTurn(actions: Action[]): TurnResult {
 		if (!this.state) throw new Error("Engine not initialized");
 		this.state.turn += 1;
 		const events: string[] = [];
+		const anim: AnimationEvent[] = [];
+		// temporary binding so inner helpers can emit animations without threading a param everywhere
+		(this as any)._pushAnim = (ev: AnimationEvent) => { anim.push(ev); };
 		const log: LogSink = (msg) => {
 			this.state.log.push(msg);
 			events.push(msg);
@@ -75,22 +104,167 @@ export class Engine implements BattleRuleset {
 			if (!actor || actor.currentHP <= 0) continue; // fainted already
 			if (action.type === "move") {
 				const ma = action as MoveAction;
-				const move = actor.moves.find((m) => m.id === ma.moveId);
+				// Status gating at start of action
+				if (actor.status === "sleep") {
+					const turns = actor.volatile?.sleepTurns ?? 0;
+					if (turns > 0) {
+						actor.volatile = actor.volatile || {};
+						(actor.volatile as any).sleepTurns = Math.max(0, turns - 1);
+						if ((actor.volatile as any).sleepTurns > 0) {
+							log(`${actor.name} is fast asleep.`);
+							continue;
+						} else {
+							actor.status = "none";
+							log(`${actor.name} woke up!`);
+						}
+					}
+				}
+				if (actor.status === "freeze") {
+					const thaw = this.rng() < 0.2;
+					if (thaw) {
+						actor.status = "none";
+						log(`${actor.name} thawed out!`);
+					} else {
+						log(`${actor.name} is frozen solid!`);
+						continue;
+					}
+				}
+				if (actor.status === "paralysis") {
+					if (this.rng() < 0.25) {
+						log(`${actor.name} is paralyzed! It can't move!`);
+						continue;
+					}
+				}
+				// Encore enforcement: if actor is encored, force the selected moveId
+				if ((actor.volatile?.encoreTurns ?? 0) > 0 && actor.volatile?.encoreMoveId) {
+					const forcedId = actor.volatile.encoreMoveId as string;
+					if (ma.moveId !== forcedId) {
+						ma.moveId = forcedId;
+					}
+				}
+				let requested = actor.moves.find((m) => m.id === ma.moveId);
+				let move = requested;
 				const target = this.getPokemonById(ma.targetPokemonId);
-				if (!move || !target) continue;
+				if (!target) continue;
+				actor.volatile = actor.volatile || {};
+				(actor.volatile as any).pp = (actor.volatile as any).pp || {};
+				const ppStore = (actor.volatile as any).pp as Record<string, number>;
+				// Choice item lock enforcement: if holding a Choice item and locked, block other moves
+				const hasChoice = ["choice_band","choice_specs","choice_scarf"].includes((actor.item ?? "").toLowerCase());
+				const lockedId = (actor.volatile as any).choiceLockedMoveId as string | undefined;
+				if (hasChoice && lockedId && requested && requested.id !== lockedId) {
+					// Allow Struggle fallback path to handle when no PP remains on any move; otherwise block
+					log(`${actor.name} is locked into ${lockedId} due to its Choice item!`);
+					continue;
+				}
+				// Determine PP availability
+				const hasAnyPP = actor.moves.some(m => (ppStore[m.id] ?? (m.pp ?? 10)) > 0);
+				let usingStruggle = false;
+				if (!move) {
+					// Missing move definition: if no PP anywhere, fall back silently to Struggle
+					if (!hasAnyPP) {
+						move = { id: "__struggle", name: "Struggle", type: "Normal", category: "Physical", power: 50 } as any;
+						usingStruggle = true;
+					} else {
+						continue;
+					}
+				} else {
+					// Move exists: check its remaining PP
+					const basePP0 = move.pp ?? 10;
+					const remaining0 = ppStore[move.id] ?? basePP0;
+					if (remaining0 <= 0) {
+						if (hasAnyPP) {
+							log(`${actor.name} has no PP left for ${move.name}!`);
+							continue;
+						} else {
+							// Log the PP exhaustion, then use Struggle
+							log(`${actor.name} has no PP left for ${move.name}!`);
+							move = { id: "__struggle", name: "Struggle", type: "Normal", category: "Physical", power: 50 } as any;
+							usingStruggle = true;
+						}
+					}
+				}
+				if (!move) continue;
+				// At this point, either using Struggle or we have PP to use the move
+				const basePP = move.pp ?? 10;
+				const remaining = ppStore[move.id] ?? basePP;
 				log(`${actor.name} used ${move.name}!`);
+				anim.push({ type: "move:start", payload: { userId: actor.id, moveId: move.id } });
+				// Taunt: block Status-category moves while taunted (skip for Struggle)
+				if (!usingStruggle && (actor.volatile?.tauntTurns ?? 0) > 0 && move.category === "Status") {
+					log(`${actor.name} can't use status moves due to Taunt!`);
+					anim.push({ type: "status:taunt:block", payload: { userId: actor.id, moveId: move.id } });
+					continue;
+				}
+				// Disable: if this specific move is disabled, block it (skip for Struggle)
+				if (!usingStruggle && (actor.volatile?.disabledTurns ?? 0) > 0 && actor.volatile?.disabledMoveId === move.id) {
+					log(`${actor.name} can't use ${move.name} due to Disable!`);
+					anim.push({ type: "status:disable:block", payload: { userId: actor.id, moveId: move.id } });
+					continue;
+				}
+				// Torment: cannot use the same move twice in a row (skip for Struggle)
+				if (!usingStruggle && (actor.volatile?.tormentTurns ?? 0) > 0 && (actor.volatile?.lastMoveId === move.id)) {
+					log(`${actor.name} can't use ${move.name} twice in a row due to Torment!`);
+					anim.push({ type: "status:torment:block", payload: { userId: actor.id, moveId: move.id } });
+					continue;
+				}
+				// Track last used move for mechanics like Encore/Disable source
+				actor.volatile = actor.volatile || {};
+				(actor.volatile as any).lastMoveId = move.id;
 				this.executeMove(move, actor, target, log);
+				// Struggle recoil: 25% of user's max HP after executing Struggle
+				if (usingStruggle && actor.currentHP > 0) {
+					const recoil = Math.max(1, Math.floor(actor.maxHP / 4));
+					const selfDmg = this.utils(log).dealDamage(actor, recoil);
+					log(`${actor.name} was hurt by recoil! (-${selfDmg})`);
+					anim.push({ type: "move:recoil", payload: { userId: actor.id, damage: selfDmg } });
+				}
+				// Set Choice lock after first successful move (skip Struggle)
+				if (!usingStruggle && hasChoice && !(actor.volatile as any).choiceLockedMoveId) {
+					(actor.volatile as any).choiceLockedMoveId = move.id;
+				}
+				// Decrement PP only on successful execution (skip for Struggle). Pressure causes -2 per use.
+				if (!usingStruggle) {
+					let dec = 1;
+					const targetHasPressure = (target.ability === "pressure");
+					if (targetHasPressure) dec = 2;
+					ppStore[move.id] = Math.max(0, (ppStore[move.id] ?? basePP) - dec);
+				}
+				// Life Orb recoil only if a damaging move dealt damage this turn (handled in executeMove via anim? we check damage dealt by examining last pushed move:hit anim)
+				if (actor.item === "life_orb" && move.category !== "Status") {
+					// naive check: if target took any damage this action (totalDealt tracked? we infer by lastMoveId + target hp change)
+					// Simpler: emit a marker on actor when executeMove dealt damage; read and clear here
+					if ((actor.volatile as any).dealtDamageThisAction) {
+						const recoil = Math.max(1, Math.floor(actor.maxHP / 10));
+						const selfDmg = this.utils(log).dealDamage(actor, recoil);
+						log(`${actor.name} is hurt by its Life Orb! (-${selfDmg})`);
+						anim.push({ type: "item:life-orb:recoil", payload: { pokemonId: actor.id, damage: selfDmg } });
+						(actor.volatile as any).dealtDamageThisAction = false;
+					}
+				}
 				if (target.currentHP <= 0) {
 					log(`${target.name} fainted!`);
+					anim.push({ type: "pokemon:faint", payload: { pokemonId: target.id } });
 				}
 			} else if (action.type === "switch") {
 				// Basic switch: change active index
 				const player = this.state.players.find((p) => p.id === action.actorPlayerId);
 				if (!player) continue;
+				// Clear substitute and reset stages/volatiles on the outgoing mon (substitute doesn't persist on switch)
+				const outgoing = player.team[player.activeIndex];
+				if (outgoing) {
+					if (outgoing.volatile) (outgoing.volatile as any).substituteHP = 0;
+					// Reset stages
+					outgoing.stages = { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, acc: 0, eva: 0 };
+					// Preserve PP store but clear other volatiles including Choice lock and temporary effects
+					const ppKeep = (outgoing.volatile as any)?.pp;
+					outgoing.volatile = { pp: ppKeep } as any;
+				}
 				player.activeIndex = Math.max(0, Math.min(player.team.length - 1, action.toIndex));
 				const active = player.team[player.activeIndex];
 				log(`${player.name} switched to ${active.name}!`);
 				this.emitSwitchIn(active, log);
+				anim.push({ type: "switch", payload: { playerId: player.id, pokemonId: active.id } });
 			}
 		}
 
@@ -98,8 +272,91 @@ export class Engine implements BattleRuleset {
 		for (const p of this.state.players) {
 			const mon = p.team[p.activeIndex];
 			if (mon.currentHP > 0) this.emitStatusTick(mon, mon.status, log);
-				if (mon.item && Items[mon.item]?.onEndOfTurn) Items[mon.item].onEndOfTurn!(mon, this.state, log);
+					if (mon.item && Items[mon.item]?.onEndOfTurn) Items[mon.item].onEndOfTurn!(mon, this.state, log);
+				// Clear one-turn volatiles like Protect
+				if (mon.volatile) {
+					if ((mon.volatile as any).protect) {
+						(mon.volatile as any).protect = false;
+					} else if ((mon.volatile as any).protectChain) {
+						// If Protect wasn't used successfully this turn, reset the chain
+						(mon.volatile as any).protectChain = 0;
+					}
+						// Magnet Rise duration
+						if ((mon.volatile as any).magnetRiseTurns && (mon.volatile as any).magnetRiseTurns > 0) {
+							(mon.volatile as any).magnetRiseTurns -= 1;
+							if ((mon.volatile as any).magnetRiseTurns === 0) {
+								log(`${mon.name} came back down to the ground.`);
+								anim.push({ type: "status:magnetrise:end", payload: { pokemonId: mon.id } });
+							}
+						}
+						// Taunt duration
+						if ((mon.volatile as any).tauntTurns && (mon.volatile as any).tauntTurns > 0) {
+							(mon.volatile as any).tauntTurns -= 1;
+							if ((mon.volatile as any).tauntTurns === 0) {
+								log(`${mon.name} is no longer taunted.`);
+								anim.push({ type: "status:taunt:end", payload: { pokemonId: mon.id } });
+							}
+						}
+						// Encore duration
+						if ((mon.volatile as any).encoreTurns && (mon.volatile as any).encoreTurns > 0) {
+							(mon.volatile as any).encoreTurns -= 1;
+							if ((mon.volatile as any).encoreTurns === 0) {
+								log(`${mon.name}'s Encore ended!`);
+								anim.push({ type: "status:encore:end", payload: { pokemonId: mon.id } });
+							}
+						}
+						// Disable duration
+						if ((mon.volatile as any).disabledTurns && (mon.volatile as any).disabledTurns > 0) {
+							(mon.volatile as any).disabledTurns -= 1;
+							if ((mon.volatile as any).disabledTurns === 0) {
+								log(`${mon.name}'s Disable wore off!`);
+								(mon.volatile as any).disabledMoveId = undefined;
+								anim.push({ type: "status:disable:end", payload: { pokemonId: mon.id } });
+							}
+						}
+						// Torment duration
+						if ((mon.volatile as any).tormentTurns && (mon.volatile as any).tormentTurns > 0) {
+							(mon.volatile as any).tormentTurns -= 1;
+							if ((mon.volatile as any).tormentTurns === 0) {
+								log(`${mon.name} is no longer tormented.`);
+								anim.push({ type: "status:torment:end", payload: { pokemonId: mon.id } });
+							}
+						}
+				}
 		}
+
+			// Default non-volatile status residuals
+			for (const pl of this.state.players) {
+				const mon = pl.team[pl.activeIndex];
+				if (mon.currentHP <= 0) continue;
+				switch (mon.status) {
+					case "burn": {
+						const dmg = Math.max(1, Math.floor(mon.maxHP / 16));
+						mon.currentHP = Math.max(0, mon.currentHP - dmg);
+						log(`${mon.name} is hurt by its burn! (${dmg})`);
+						anim.push({ type: "status:burn:tick", payload: { pokemonId: mon.id, damage: dmg } });
+						break;
+					}
+					case "poison": {
+						const dmg = Math.max(1, Math.floor(mon.maxHP / 8));
+						mon.currentHP = Math.max(0, mon.currentHP - dmg);
+						log(`${mon.name} is hurt by poison! (${dmg})`);
+						anim.push({ type: "status:poison:tick", payload: { pokemonId: mon.id, damage: dmg } });
+						break;
+					}
+					case "toxic": {
+						mon.volatile = mon.volatile || {};
+						const prev = (mon.volatile as any).toxicCounter ?? 0;
+						(mon.volatile as any).toxicCounter = prev + 1;
+						const counter = (mon.volatile as any).toxicCounter as number;
+						const dmg = Math.max(1, Math.floor((mon.maxHP / 16) * counter));
+						mon.currentHP = Math.max(0, mon.currentHP - dmg);
+						log(`${mon.name} is hurt by poison! (${dmg})`);
+						anim.push({ type: "status:toxic:tick", payload: { pokemonId: mon.id, damage: dmg, counter } });
+						break;
+					}
+				}
+			}
 
 			// Weather residuals (very simplified)
 			if (this.state.field.weather.id === "sandstorm") {
@@ -111,6 +368,7 @@ export class Engine implements BattleRuleset {
 					const dmg = Math.max(1, Math.floor(mon.maxHP / 16));
 					mon.currentHP = Math.max(0, mon.currentHP - dmg);
 					log(`${mon.name} is buffeted by the sandstorm! (${dmg})`);
+					anim.push({ type: "weather:sandstorm:tick", payload: { pokemonId: mon.id, damage: dmg } });
 				}
 			}
 
@@ -124,16 +382,52 @@ export class Engine implements BattleRuleset {
 					mon.currentHP = Math.min(mon.maxHP, mon.currentHP + heal);
 					const delta = mon.currentHP - before;
 					if (delta > 0) log(`${mon.name} is healed by the grassy terrain. (+${delta})`);
+					if (delta > 0) anim.push({ type: "terrain:grassy:heal", payload: { pokemonId: mon.id, heal: delta } });
 				}
 			}
 
-			// Decrement durations
+			// Decrement durations with end notifications
+			const prevWeather = { ...this.state.field.weather };
+			const prevTerrain = { ...this.state.field.terrain };
 			if (this.state.field.weather.turnsLeft > 0) this.state.field.weather.turnsLeft -= 1;
-			if (this.state.field.weather.turnsLeft === 0) this.state.field.weather.id = "none";
 			if (this.state.field.terrain.turnsLeft > 0) this.state.field.terrain.turnsLeft -= 1;
-			if (this.state.field.terrain.turnsLeft === 0) this.state.field.terrain.id = "none";
+			if (prevWeather.id !== "none" && prevWeather.turnsLeft === 1) {
+				// ended now
+				log(`${prevWeather.id} weather subsided.`);
+				anim.push({ type: `weather:${prevWeather.id}:end`, payload: {} });
+				this.state.field.weather.id = "none";
+			}
+			if (prevTerrain.id !== "none" && prevTerrain.turnsLeft === 1) {
+				log(`The ${prevTerrain.id} terrain faded.`);
+				anim.push({ type: `terrain:${prevTerrain.id}:end`, payload: {} });
+				this.state.field.terrain.id = "none";
+			}
 
-		return { state: this.state, events };
+			// Side conditions timers: Tailwind, Reflect, Light Screen
+			for (const pl of this.state.players) {
+				if (!pl.sideConditions) continue;
+				const before = { t: pl.sideConditions.tailwindTurns ?? 0, r: pl.sideConditions.reflectTurns ?? 0, l: pl.sideConditions.lightScreenTurns ?? 0 };
+				if ((pl.sideConditions.tailwindTurns ?? 0) > 0) pl.sideConditions.tailwindTurns!--;
+				if ((pl.sideConditions.reflectTurns ?? 0) > 0) pl.sideConditions.reflectTurns!--;
+				if ((pl.sideConditions.lightScreenTurns ?? 0) > 0) pl.sideConditions.lightScreenTurns!--;
+				if (before.t === 1 && (pl.sideConditions.tailwindTurns ?? 0) === 0) {
+					log(`Tailwind petered out for ${pl.name}'s side.`);
+					anim.push({ type: "side:tailwind:end", payload: { playerId: pl.id } });
+				}
+				if (before.r === 1 && (pl.sideConditions.reflectTurns ?? 0) === 0) {
+					log(`Reflect wore off on ${pl.name}'s side.`);
+					anim.push({ type: "side:reflect:end", payload: { playerId: pl.id } });
+				}
+				if (before.l === 1 && (pl.sideConditions.lightScreenTurns ?? 0) === 0) {
+					log(`Light Screen wore off on ${pl.name}'s side.`);
+					anim.push({ type: "side:lightscreen:end", payload: { playerId: pl.id } });
+				}
+			}
+
+		const result = { state: this.state, events, anim } as TurnResult;
+		// cleanup binding
+		(this as any)._pushAnim = undefined;
+		return result;
 	}
 
 	// Event subscriptions
@@ -162,6 +456,17 @@ export class Engine implements BattleRuleset {
 			for (const mon of pl.team) if (mon.id === id) return mon;
 		}
 		return undefined;
+	}
+
+	private isGrounded(p: Pokemon): boolean {
+		// Flying-types are not grounded
+		if (p.types.includes("Flying")) return false;
+		// Magnet Rise volatile effect
+		if ((p.volatile?.magnetRiseTurns ?? 0) > 0) return false;
+		// Air Balloon item
+		const item = (p.item ?? "").toLowerCase();
+		if (["air_balloon", "airballoon", "air-balloon"].includes(item)) return false;
+		return true;
 	}
 
 	private compareActions(a: Action, b: Action): number {
@@ -201,16 +506,34 @@ export class Engine implements BattleRuleset {
 		if (move.onUse) {
 			move.onUse({ state: this.state, user, target, move, log, utils: this.utils(log) });
 		} else if (move.power && move.category !== "Status") {
-				// Accuracy check
+			// Protect check (volatile flag set by move effects)
+			if (target.volatile?.protect) {
+				log(`${target.name} protected itself!`);
+				(this as any)._pushAnim?.({ type: "move:blocked", payload: { targetId: target.id } });
+				return;
+			}
+				// Accuracy check incl. acc/eva stages and No Guard
 				if (move.accuracy != null) {
-					const acc = this.modifyAccuracy(user, move.accuracy);
-					const roll = this.rng() * 100;
-					if (roll >= acc) {
-						log(`${user.name}'s attack missed!`);
-						return;
+					const noGuard = (["no_guard", "noguard"].includes(user.ability ?? "")) || (["no_guard", "noguard"].includes(target.ability ?? ""));
+					if (!noGuard) {
+						const accStage = user.stages.acc ?? 0;
+						const evaStage = target.stages.eva ?? 0;
+						const accMult = stageMultiplier(accStage, 3, 3);
+						const evaMult = stageMultiplier(evaStage, 3, 3);
+						let effectiveAcc = (move.accuracy as number) * (accMult / evaMult);
+						effectiveAcc = this.modifyAccuracy(user, effectiveAcc);
+						effectiveAcc = Math.max(1, Math.min(100, Math.floor(effectiveAcc)));
+						const roll = this.rng() * 100;
+						if (roll >= effectiveAcc) {
+							log(`${user.name}'s attack missed!`);
+							return;
+						}
 					}
 				}
 
+				// reset damage marker for Life Orb timing
+				user.volatile = user.volatile || {};
+				(user.volatile as any).dealtDamageThisAction = false;
 				const hits = this.getMultiHit(move);
 				let totalDealt = 0;
 				let effectivenessSeen: number | null = null;
@@ -221,6 +544,17 @@ export class Engine implements BattleRuleset {
 					const atk = this.modifyAttack(user, this.getEffectiveAttack(user, move.category), move.category);
 					const def = this.modifyDefense(target, chooseDefenseStat(target, move.category), move.category);
 					const crit = this.rollCrit(move.critRatio ?? 0);
+					// Ground immunity via Levitate/Magnet Rise/Air Balloon (Flying handled by type chart)
+					if (move.type === "Ground") {
+						const hasLevitate = target.ability === "levitate";
+						const hasMagnetRise = (target.volatile?.magnetRiseTurns ?? 0) > 0;
+						const hasBalloon = ["air_balloon", "airballoon", "air-balloon"].includes((target.item ?? "").toLowerCase());
+						if (hasLevitate || hasMagnetRise || hasBalloon) {
+							log(`${target.name} is unaffected by Ground moves!`);
+							effectivenessSeen = 0;
+							continue;
+						}
+					}
 					const { damage, effectiveness, stab } = calcDamage(user, target, move, atk, def, { rng: () => this.rng() });
 					effectivenessSeen = effectivenessSeen ?? effectiveness;
 					let finalDamage = damage;
@@ -231,7 +565,50 @@ export class Engine implements BattleRuleset {
 					// Ability/item damage mods hooks
 					finalDamage = this.modifyDamage(user, target, finalDamage);
 
-					const dealt = this.utils(log).dealDamage(target, finalDamage);
+					// Field modifiers: weather/terrain simplified + conditional ability boosts
+					finalDamage = this.applyFieldDamageMods(finalDamage, move, user);
+
+					// Side conditions: Reflect/Light Screen on the target's side (ignored on critical hits)
+					const targetOwner = this.state.players.find(pl => pl.team.some(m => m.id === target.id));
+					if (!crit && targetOwner?.sideConditions) {
+						if (move.category === "Physical" && (targetOwner.sideConditions.reflectTurns ?? 0) > 0) {
+							finalDamage = Math.floor(finalDamage * 0.5);
+						}
+						if (move.category === "Special" && (targetOwner.sideConditions.lightScreenTurns ?? 0) > 0) {
+							finalDamage = Math.floor(finalDamage * 0.5);
+						}
+					}
+
+					// Survival effects (Focus Sash/Sturdy)
+					finalDamage = this.applySurvivalEffects(target, user, finalDamage, log);
+
+					// Substitute redirection: if target has a substitute, damage the sub instead
+					let dealt: number;
+					if ((target.volatile as any)?.substituteHP && (target.volatile as any).substituteHP > 0) {
+						const subHP = (target.volatile as any).substituteHP as number;
+						const dmgToSub = Math.min(subHP, finalDamage);
+						(target.volatile as any).substituteHP = subHP - dmgToSub;
+						dealt = dmgToSub;
+						(this as any)._pushAnim?.({ type: "substitute:hit", payload: { targetId: target.id, damage: dmgToSub } });
+						if ((target.volatile as any).substituteHP === 0) {
+							log(`${target.name}'s substitute faded!`);
+							(this as any)._pushAnim?.({ type: "substitute:break", payload: { pokemonId: target.id } });
+						}
+					} else {
+						dealt = this.utils(log).dealDamage(target, finalDamage);
+					}
+					if (dealt > 0) {
+						(this as any)._pushAnim?.({ type: "move:hit", payload: { targetId: target.id, damage: dealt } });
+						// mark on user that damage was dealt this action for Life Orb timing
+						user.volatile = user.volatile || {};
+						(user.volatile as any).dealtDamageThisAction = true;
+					}
+					// Pop Air Balloon if present and took damage
+					if (dealt > 0 && ["air_balloon", "airballoon", "air-balloon"].includes((target.item ?? "").toLowerCase())) {
+						log(`${target.name}'s Air Balloon popped!`);
+						(this as any)._pushAnim?.({ type: "item:air-balloon:pop", payload: { pokemonId: target.id } });
+						target.item = undefined;
+					}
 					totalDealt += dealt;
 				}
 
@@ -243,6 +620,23 @@ export class Engine implements BattleRuleset {
 				if (critHappened) log("A critical hit!");
 				if (effectivenessSeen! > 1) log("It's super effective!");
 				else if (effectivenessSeen! < 1) log("It's not very effective...");
+
+				// Post-damage switch for pivoting moves (U-turn / Volt Switch simplified)
+				if (move.switchesUserOut) {
+					const owner = this.state.players.find(pl => pl.team.some(m => m.id === user.id));
+					if (owner && user.currentHP > 0) {
+						// pick first healthy bench mon different from current active
+						const currentIdx = owner.team.findIndex(m => m.id === user.id);
+						const nextIdx = owner.team.findIndex((m, idx) => idx !== currentIdx && m.currentHP > 0);
+						if (nextIdx >= 0) {
+							owner.activeIndex = nextIdx;
+							const next = owner.team[nextIdx];
+							log(`${owner.name} pivoted out to ${next.name}!`);
+							this.emitSwitchIn(next, log);
+							(this as any)._pushAnim?.({ type: "switch", payload: { playerId: owner.id, pokemonId: next.id } });
+						}
+					}
+				}
 		}
 	}
 
@@ -252,6 +646,55 @@ export class Engine implements BattleRuleset {
 
 	private emitSwitchIn(pokemon: Pokemon, log: LogSink = (m) => this.state.log.push(m)) {
 		for (const h of this.switchInHandlers) h(pokemon, this.state, log);
+		// Hazards: Stealth Rock (stored on the side the Pokémon belongs to)
+		const owner = this.state.players.find(p => p.team.some(m => m.id === pokemon.id));
+		// Initialize PP store
+		pokemon.volatile = pokemon.volatile || {};
+		(pokemon.volatile as any).pp = (pokemon.volatile as any).pp || {};
+		// Reset toxic counter on switch-in
+		(pokemon.volatile as any).toxicCounter = 0;
+		// Clear substitute on switch-in (cannot persist)
+		if (pokemon.volatile) (pokemon.volatile as any).substituteHP = 0;
+		// Heavy-Duty Boots: ignore all hazard effects (including absorption)
+		const hasBoots = ["heavy-duty-boots","heavy_duty_boots","heavydutyboots"].includes(pokemon.item ?? "");
+		if (hasBoots) return;
+		if (owner?.sideHazards?.stealthRock) {
+			const mult = typeEffectiveness("Rock", pokemon.types);
+			const frac = (1 / 8) * mult; // simplified scaling by effectiveness
+			const dmg = Math.max(1, Math.floor(pokemon.maxHP * frac));
+			pokemon.currentHP = Math.max(0, pokemon.currentHP - dmg);
+			log(`${pokemon.name} is hurt by Stealth Rock! (-${dmg})`);
+			(this as any)._pushAnim?.({ type: "hazard:stealth-rock", payload: { pokemonId: pokemon.id, damage: dmg } });
+		}
+		// Hazards: Spikes (grounded only)
+		if (owner?.sideHazards?.spikesLayers && this.isGrounded(pokemon)) {
+			const layers = Math.max(1, Math.min(3, owner.sideHazards.spikesLayers));
+			const frac = layers === 1 ? 1/8 : layers === 2 ? 1/6 : 1/4;
+			const dmg = Math.max(1, Math.floor(pokemon.maxHP * frac));
+			pokemon.currentHP = Math.max(0, pokemon.currentHP - dmg);
+			log(`${pokemon.name} is hurt by Spikes! (-${dmg})`);
+			(this as any)._pushAnim?.({ type: "hazard:spikes", payload: { pokemonId: pokemon.id, layers, damage: dmg } });
+		}
+		// Hazards: Toxic Spikes (grounded only): 1 layer = poison, 2 layers = bad poison; Poison-type absorbs
+		if (owner?.sideHazards?.toxicSpikesLayers && this.isGrounded(pokemon)) {
+			if (pokemon.types.includes("Poison")) {
+				// Absorb and clear
+				owner.sideHazards.toxicSpikesLayers = 0;
+				log(`${pokemon.name} absorbed the Toxic Spikes!`);
+				(this as any)._pushAnim?.({ type: "hazard:toxicspikes:absorb", payload: { pokemonId: pokemon.id } });
+			} else if (pokemon.status === "none") {
+				const layers = Math.max(1, Math.min(2, owner.sideHazards.toxicSpikesLayers));
+				pokemon.status = layers >= 2 ? "toxic" : "poison";
+				log(`${pokemon.name} was poisoned by Toxic Spikes!`);
+				(this as any)._pushAnim?.({ type: "hazard:toxicspikes", payload: { pokemonId: pokemon.id, layers } });
+			}
+		}
+		// Hazards: Sticky Web (grounded only) -> drop speed stage by 1
+		if (owner?.sideHazards?.stickyWeb && this.isGrounded(pokemon)) {
+			pokemon.stages.spe = Math.max(-6, (pokemon.stages.spe ?? 0) - 1);
+			log(`${pokemon.name}'s Speed was lowered by Sticky Web!`);
+			(this as any)._pushAnim?.({ type: "hazard:stickyweb", payload: { pokemonId: pokemon.id } });
+		}
 	}
 
 	private utils(log: LogSink): EngineUtils {
@@ -261,10 +704,44 @@ export class Engine implements BattleRuleset {
 				pokemon.currentHP = clamp(pokemon.currentHP - Math.max(0, Math.floor(amount)), 0, pokemon.maxHP);
 				return before - pokemon.currentHP;
 			},
+			heal: (pokemon, amount) => {
+				const before = pokemon.currentHP;
+				pokemon.currentHP = clamp(pokemon.currentHP + Math.max(0, Math.floor(amount)), 0, pokemon.maxHP);
+				const healed = pokemon.currentHP - before;
+				if (healed > 0) (this as any)._pushAnim?.({ type: "heal", payload: { pokemonId: pokemon.id, heal: healed } });
+				return healed;
+			},
 			applyStatus: (pokemon, status) => {
+				// Block status application if a Substitute is active
+				if (((pokemon.volatile as any)?.substituteHP ?? 0) > 0) return;
+				// Type/field immunities (subset)
+				const types = pokemon.types;
+				if (status === "burn" && types.includes("Fire")) return;
+				if ((status === "poison" || status === "toxic") && (types.includes("Steel") || types.includes("Poison"))) return;
+				if (status === "paralysis" && types.includes("Electric")) return;
+				if (status === "sleep") {
+					if (this.state.field.terrain.id === "electric" && this.isGrounded(pokemon)) {
+						return;
+					}
+				}
 				if (pokemon.status === "none") {
 					pokemon.status = status;
+					// Initialize timers/counters for some statuses
+					if (status === "sleep") {
+						pokemon.volatile = pokemon.volatile || {};
+						(pokemon.volatile as any).sleepTurns = 2; // simplified duration
+					}
+					if (status === "toxic") {
+						pokemon.volatile = pokemon.volatile || {};
+						(pokemon.volatile as any).toxicCounter = 0;
+					}
 					log(`${pokemon.name} is now ${status}!`);
+					// Lum Berry cures on application
+					if ((pokemon.item ?? "").toLowerCase() === "lum_berry") {
+						pokemon.status = "none";
+						pokemon.item = undefined;
+						log(`${pokemon.name}'s Lum Berry cured its status!`);
+					}
 				}
 			},
 					modifyStatStages: (pokemon, changes) => {
@@ -277,6 +754,8 @@ export class Engine implements BattleRuleset {
 					},
 			getEffectiveSpeed: (pokemon) => this.getEffectiveSpeed(pokemon),
 			getEffectiveAttack: (pokemon, category) => this.getEffectiveAttack(pokemon, category),
+			emitAnim: (event) => ((this as any)._pushAnim?.(event)),
+			rng: () => this.rng(),
 		};
 	}
 
@@ -284,7 +763,19 @@ export class Engine implements BattleRuleset {
 		const base = p.baseStats.spe;
 		let mult = stageMultiplier(p.stages.spe ?? 0);
 		if (p.status === "paralysis") mult *= 0.5; // simplified
-		return Math.floor(base * mult);
+		// Weather speed abilities
+		if (this.state.field.weather.id === "rain" && ["swift_swim","swiftswim"].includes(p.ability ?? "")) mult *= 2;
+		if (this.state.field.weather.id === "sun" && p.ability === "chlorophyll") mult *= 2;
+		// Tailwind on owner's side doubles speed
+		const owner = this.state.players.find(pl => pl.team.some(m => m.id === p.id));
+		if (owner?.sideConditions?.tailwindTurns && owner.sideConditions.tailwindTurns > 0) {
+			mult *= 2;
+		}
+		let speed = Math.floor(base * mult);
+		// Ability/item hooks
+		if (p.ability && Abilities[p.ability]?.onModifySpeed) speed = Abilities[p.ability].onModifySpeed!(p, speed);
+		if (p.item && Items[p.item]?.onModifySpeed) speed = Items[p.item].onModifySpeed!(p, speed);
+		return speed;
 	}
 
 	private getEffectiveAttack(p: Pokemon, category: Category): number {
@@ -294,6 +785,58 @@ export class Engine implements BattleRuleset {
 		let mult = stageMultiplier(stage);
 		if (isPhysical && p.status === "burn") mult *= 0.5; // simplified burn halving
 			return Math.floor(base * mult);
+	}
+
+	private applyFieldDamageMods(damage: number, move: Move, user: Pokemon): number {
+		const weather = this.state.field.weather.id;
+		const terrain = this.state.field.terrain.id;
+		let d = damage;
+		// Weather
+		if (weather === "sun") {
+			if (move.type === "Fire") d = Math.floor(d * 1.5);
+			if (move.type === "Water") d = Math.floor(d * 0.5);
+		}
+		if (weather === "rain") {
+			if (move.type === "Water") d = Math.floor(d * 1.5);
+			if (move.type === "Fire") d = Math.floor(d * 0.5);
+		}
+		if (weather === "snow" || weather === "hail") {
+			if (move.type === "Ice") d = Math.floor(d * 1.5);
+		}
+		// Terrain (subset)
+		if (terrain === "grassy") {
+			if (move.type === "Grass") d = Math.floor(d * 1.3);
+		}
+		// Conditional abilities at low HP
+		if (user.currentHP <= Math.floor(user.maxHP / 3)) {
+			if (user.ability === "blaze" && move.type === "Fire") d = Math.floor(d * 1.5);
+			if (user.ability === "torrent" && move.type === "Water") d = Math.floor(d * 1.5);
+			if (user.ability === "overgrow" && move.type === "Grass") d = Math.floor(d * 1.5);
+		}
+		return d;
+	}
+
+	private applySurvivalEffects(target: Pokemon, user: Pokemon, damage: number, log: LogSink): number {
+		if (damage < target.currentHP) return damage;
+		if (target.currentHP <= 1) return damage;
+		// Only from full HP
+		if (target.currentHP === target.maxHP) {
+			if (target.item === "focus_sash") {
+				const reduced = target.currentHP - 1;
+				log(`${target.name} hung on using its Focus Sash!`);
+				(this as any)._pushAnim?.({ type: "survive:focus-sash", payload: { pokemonId: target.id } });
+				// consume item
+				target.item = undefined;
+				return reduced;
+			}
+			if (target.ability === "sturdy") {
+				const reduced = target.currentHP - 1;
+				log(`${target.name} endured the hit with Sturdy!`);
+				(this as any)._pushAnim?.({ type: "survive:sturdy", payload: { pokemonId: target.id } });
+				return reduced;
+			}
+		}
+		return damage;
 	}
 
 		// Accuracy modifications via abilities/items (simplified)
@@ -322,6 +865,8 @@ export class Engine implements BattleRuleset {
 		private modifyDamage(user: Pokemon, target: Pokemon, damage: number): number {
 			if (user.ability && Abilities[user.ability]?.onModifyDamage)
 				damage = Abilities[user.ability].onModifyDamage!(user, target, damage);
+			if (user.item && Items[user.item]?.onModifyDamage)
+				damage = Items[user.item].onModifyDamage!(user, damage);
 			return damage;
 		}
 
@@ -338,6 +883,12 @@ export class Engine implements BattleRuleset {
 			const r = this.rng();
 			return min + Math.floor(r * (max - min + 1));
 		}
+
+	// Simple helper to set/unset Protect on a Pokémon for this turn
+	setProtect(pokemon: Pokemon, enabled: boolean) {
+		pokemon.volatile = pokemon.volatile || {};
+		(pokemon.volatile as any).protect = enabled;
+	}
 }
 
 export default Engine;

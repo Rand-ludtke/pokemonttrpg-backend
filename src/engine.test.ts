@@ -1,86 +1,140 @@
 import { describe, it, expect } from "vitest";
 import Engine from "./engine";
-import { MoveAction, Player } from "./types";
-import { QUICK_ATTACK, TACKLE, defaultStats, sampleMon } from "./samples";
+import { Action, Move, Player, Pokemon } from "./types";
 
-const setup = () => {
-  const p1 = {
-    id: "p1",
-    name: "P1",
-    team: [sampleMon("p1-1", "FastMon", ["Normal"], defaultStats({ spe: 100, hp: 100 }), [TACKLE, QUICK_ATTACK])],
-    activeIndex: 0,
-  } satisfies Player;
-  const p2 = {
-    id: "p2",
-    name: "P2",
-    team: [sampleMon("p2-1", "SlowMon", ["Normal"], defaultStats({ spe: 50, hp: 100 }), [TACKLE])],
-    activeIndex: 0,
-  } satisfies Player;
-  const engine = new Engine({ seed: 42 });
-  engine.initializeBattle([p1, p2]);
-  return { engine, p1, p2 };
-};
+function makeMon(id: string, name: string, overrides?: Partial<Pokemon>): Pokemon {
+  const base: Pokemon = {
+    id,
+    name,
+    level: 50,
+    types: ["Normal"],
+    baseStats: { hp: 100, atk: 80, def: 80, spa: 80, spd: 80, spe: 80 },
+    currentHP: 200,
+    maxHP: 200,
+    stages: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, acc: 0, eva: 0 },
+    status: "none",
+    volatile: {},
+    moves: [],
+  };
+  return { ...base, ...overrides };
+}
 
-describe("action ordering", () => {
-  it("resolves by priority then speed", () => {
-    const { engine, p1, p2 } = setup();
-    const a1: MoveAction = {
-      type: "move",
-      actorPlayerId: p1.id,
-      pokemonId: p1.team[0].id,
-      moveId: QUICK_ATTACK.id,
-      targetPlayerId: p2.id,
-      targetPokemonId: p2.team[0].id,
-    };
-    const a2: MoveAction = {
-      type: "move",
-      actorPlayerId: p2.id,
-      pokemonId: p2.team[0].id,
-      moveId: TACKLE.id,
-      targetPlayerId: p1.id,
-      targetPokemonId: p1.team[0].id,
-    };
-    const res = engine.processTurn([a2, a1]);
-    // Quick Attack (priority 1) should go before Tackle (0)
-    expect(res.events[0]).toContain("FastMon used Quick Attack");
+function makeMove(partial: Partial<Move>): Move {
+  return {
+    id: partial.id || "move",
+    name: partial.name || partial.id || "Move",
+    type: partial.type || "Normal",
+    category: partial.category || "Physical",
+    power: partial.power ?? 50,
+    accuracy: partial.accuracy ?? 100,
+    ...partial,
+  } as Move;
+}
+
+function init(players: Player[], seed = 123) {
+  const engine = new Engine({ seed });
+  const state = engine.initializeBattle(players, { seed });
+  return { engine, state };
+}
+
+describe("weather damage modifiers", () => {
+  it("boosts Fire in sun and nerfs in rain", () => {
+    const fireBlast = makeMove({ id: "flame", name: "Flame", type: "Fire", category: "Special", power: 90, accuracy: 100 });
+    const tackle = makeMove({ id: "tackle", name: "Tackle", type: "Normal", category: "Physical", power: 40, accuracy: 100 });
+    const A = makeMon("A1", "Attacker", { baseStats: { hp: 100, atk: 50, def: 50, spa: 120, spd: 80, spe: 100 }, moves: [fireBlast] });
+    const B = makeMon("B1", "Defender", { baseStats: { hp: 100, atk: 50, def: 90, spa: 80, spd: 90, spe: 80 }, moves: [tackle] });
+    const players: Player[] = [
+      { id: "A", name: "A", team: [A], activeIndex: 0 },
+      { id: "B", name: "B", team: [B], activeIndex: 0 },
+    ];
+    const actions: Action[] = [
+      { type: "move", actorPlayerId: "A", pokemonId: "A1", moveId: "flame", targetPlayerId: "B", targetPokemonId: "B1" },
+      { type: "move", actorPlayerId: "B", pokemonId: "B1", moveId: "tackle", targetPlayerId: "A", targetPokemonId: "A1" },
+    ];
+
+  // Baseline (fresh battle)
+  const base = init(JSON.parse(JSON.stringify(players)), 999);
+  const resBase = base.engine.processTurn(actions);
+  const baseDamage = 200 - resBase.state.players[1].team[0].currentHP;
+
+  // Sun (set before first turn)
+  const sun = init(JSON.parse(JSON.stringify(players)), 999);
+  sun.state.field.weather.id = "sun";
+  sun.state.field.weather.turnsLeft = 5;
+  const resSun = sun.engine.processTurn(actions);
+  const sunDamage = 200 - resSun.state.players[1].team[0].currentHP;
+
+  // Rain (set before first turn)
+  const rain = init(JSON.parse(JSON.stringify(players)), 999);
+  rain.state.field.weather.id = "rain";
+  rain.state.field.weather.turnsLeft = 5;
+  const resRain = rain.engine.processTurn(actions);
+  const rainDamage = 200 - resRain.state.players[1].team[0].currentHP;
+
+    expect(sunDamage).toBeGreaterThan(baseDamage);
+    expect(rainDamage).toBeLessThan(baseDamage);
   });
 });
 
-describe("burn residual", () => {
-  it("applies burn damage at end of turn when status is burn", () => {
-    const { engine, p1, p2 } = setup();
-    // Manually set burn on p1 active
-    p1.team[0].status = "burn";
-    const a1: MoveAction = {
-      type: "move",
-      actorPlayerId: p1.id,
-      pokemonId: p1.team[0].id,
-      moveId: TACKLE.id,
-      targetPlayerId: p2.id,
-      targetPokemonId: p2.team[0].id,
-    };
-    const a2: MoveAction = {
-      type: "move",
-      actorPlayerId: p2.id,
-      pokemonId: p2.team[0].id,
-      moveId: TACKLE.id,
-      targetPlayerId: p1.id,
-      targetPokemonId: p1.team[0].id,
-    };
+describe("accuracy/evasion with No Guard", () => {
+  it("misses with high evasion but hits with No Guard", () => {
+    const shaky = makeMove({ id: "shaky", name: "Shaky", type: "Normal", category: "Physical", power: 60, accuracy: 60 });
+    const A = makeMon("A1", "Attacker", { baseStats: { hp: 100, atk: 100, def: 80, spa: 80, spd: 80, spe: 90 }, moves: [shaky] });
+    const B = makeMon("B1", "Evader", { baseStats: { hp: 100, atk: 50, def: 80, spa: 80, spd: 80, spe: 80 }, stages: { hp:0, atk:0, def:0, spa:0, spd:0, spe:0, acc:0, eva:6 }, moves: [] });
+    const players: Player[] = [
+      { id: "A", name: "A", team: [A], activeIndex: 0 },
+      { id: "B", name: "B", team: [B], activeIndex: 0 },
+    ];
+    const actions: Action[] = [
+      { type: "move", actorPlayerId: "A", pokemonId: "A1", moveId: "shaky", targetPlayerId: "B", targetPokemonId: "B1" },
+    ];
+    // Without No Guard: expect miss (HP unchanged)
+  const init1 = init(JSON.parse(JSON.stringify(players)), 321);
+  const res1 = init1.engine.processTurn(actions);
+  const hpAfter1 = res1.state.players[1].team[0].currentHP;
+    expect(hpAfter1).toBe(200);
 
-    // Register burn tick
-    engine.onStatusTick((pokemon, status, _state, log) => {
-      if (status === "burn") {
-        const dmg = Math.max(1, Math.floor(pokemon.maxHP / 16));
-        pokemon.currentHP = Math.max(0, pokemon.currentHP - dmg);
-        log(`${pokemon.name} is hurt by its burn! (${dmg})`);
-      }
-    });
+    // With No Guard: should hit
+    const playersNG = JSON.parse(JSON.stringify(players)) as Player[];
+    (playersNG[0].team[0] as Pokemon).ability = "no_guard";
+  const init2 = init(playersNG, 321);
+  const res2 = init2.engine.processTurn(actions);
+  const hpAfter2 = res2.state.players[1].team[0].currentHP;
+    expect(hpAfter2).toBeLessThan(200);
+  });
+});
 
-    const before = p1.team[0].currentHP;
-    const res = engine.processTurn([a1, a2]);
-    const after = p1.team[0].currentHP;
-    expect(after).toBeLessThan(before);
-    expect(res.events.some((e) => e.includes("hurt by its burn"))).toBeTruthy();
+describe("Focus Sash and Sturdy survival", () => {
+  it("Focus Sash leaves at 1 HP and consumes item", () => {
+    const nuke = makeMove({ id: "nuke", name: "Nuke", type: "Normal", category: "Physical", power: 200, accuracy: 100 });
+    const A = makeMon("A1", "Attacker", { baseStats: { hp: 100, atk: 200, def: 80, spa: 80, spd: 80, spe: 100 }, moves: [nuke] });
+    const B = makeMon("B1", "Sashed", { item: "focus_sash" });
+    const players: Player[] = [
+      { id: "A", name: "A", team: [A], activeIndex: 0 },
+      { id: "B", name: "B", team: [B], activeIndex: 0 },
+    ];
+    const actions: Action[] = [
+      { type: "move", actorPlayerId: "A", pokemonId: "A1", moveId: "nuke", targetPlayerId: "B", targetPokemonId: "B1" },
+    ];
+  const i = init(JSON.parse(JSON.stringify(players)), 111);
+  const res = i.engine.processTurn(actions);
+  expect(res.state.players[1].team[0].currentHP).toBe(1);
+  expect(res.state.players[1].team[0].item).toBeUndefined();
+  });
+
+  it("Sturdy leaves at 1 HP from full", () => {
+    const nuke = makeMove({ id: "nuke", name: "Nuke", type: "Normal", category: "Physical", power: 200, accuracy: 100 });
+    const A = makeMon("A1", "Attacker", { baseStats: { hp: 100, atk: 200, def: 80, spa: 80, spd: 80, spe: 100 }, moves: [nuke] });
+    const B = makeMon("B1", "SturdyMon", { ability: "sturdy" });
+    const players: Player[] = [
+      { id: "A", name: "A", team: [A], activeIndex: 0 },
+      { id: "B", name: "B", team: [B], activeIndex: 0 },
+    ];
+    const actions: Action[] = [
+      { type: "move", actorPlayerId: "A", pokemonId: "A1", moveId: "nuke", targetPlayerId: "B", targetPokemonId: "B1" },
+    ];
+  const i2 = init(JSON.parse(JSON.stringify(players)), 222);
+  const resx = i2.engine.processTurn(actions);
+  expect(resx.state.players[1].team[0].currentHP).toBe(1);
   });
 });

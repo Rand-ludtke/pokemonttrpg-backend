@@ -1,0 +1,10 @@
+import { Move, Pokemon, Player, Stats, StatusEffectSpec, TypeName } from "./types";
+export declare const TACKLE: Move;
+export declare const QUICK_ATTACK: Move;
+export declare const EMBER: Move;
+export declare const SANDSTORM_MOVE: Move;
+export declare const GRASSY_TERRAIN_MOVE: Move;
+export declare const BURN_STATUS: StatusEffectSpec;
+export declare const defaultStats: (overrides?: Partial<Stats>) => Stats;
+export declare const sampleMon: (id: string, name: string, types: TypeName[], stats: Stats, moves: Move[]) => Pokemon;
+export declare const samplePlayers: () => Player[];

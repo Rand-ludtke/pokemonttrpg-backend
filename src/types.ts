@@ -49,7 +49,9 @@ export interface Move {
 	priority?: number; // default 0
 	critRatio?: number; // 0=1/24, 1=1/8, 2=1/2, 3+=always
 	multiHit?: number | [number, number]; // exact or range (e.g., [2,5])
+	pp?: number; // base PP; if undefined, default used by engine
 	onUse?: MoveEffect; // effect logic
+	switchesUserOut?: boolean; // e.g., U-turn, Volt Switch
 }
 
 export interface StatusEffectSpec {
@@ -90,6 +92,19 @@ export interface Player {
 	name: string;
 	team: Pokemon[];
 	activeIndex: number; // index into team
+	// Side conditions (hazards etc.)
+	sideHazards?: {
+		stealthRock?: boolean;
+			spikesLayers?: number; // 1..3
+			toxicSpikesLayers?: number; // 1..2
+			stickyWeb?: boolean;
+	};
+		// Side conditions with timers (simplified)
+		sideConditions?: {
+			tailwindTurns?: number; // doubles speed while > 0
+			reflectTurns?: number; // halves physical damage while > 0
+			lightScreenTurns?: number; // halves special damage while > 0
+		};
 }
 
 export type ActionType = "move" | "switch";
@@ -138,6 +153,7 @@ export interface BattleState {
 export interface TurnResult {
 	state: BattleState;
 	events: string[]; // emitted descriptions for this turn
+	anim?: AnimationEvent[]; // animation cues for UI
 }
 
 // Event hook types
@@ -157,10 +173,14 @@ export type LogSink = (msg: string) => void;
 export interface EngineUtils {
 	// basic helpers used in effects
 	dealDamage: (pokemon: Pokemon, amount: number) => number; // returns actual damage dealt
+	heal: (pokemon: Pokemon, amount: number) => number; // returns actual HP restored
 	applyStatus: (pokemon: Pokemon, status: NonVolatileStatusId) => void;
 	modifyStatStages: (pokemon: Pokemon, changes: Partial<Record<StatName, number>>) => void;
 	getEffectiveSpeed: (pokemon: Pokemon) => number;
 	getEffectiveAttack: (pokemon: Pokemon, category: Category) => number;
+	emitAnim: (event: AnimationEvent) => void;
+	// RNG access for chance-based effects
+	rng: () => number;
 }
 
 // Ruleset interface with event subscriptions
@@ -181,4 +201,10 @@ export const stageMultiplier = (stage: number, positiveBase = 2, negativeBase = 
 };
 
 export const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+// Animation event primitive for frontends to drive visuals.
+export interface AnimationEvent {
+	type: string; // e.g., "move:start", "move:hit", "status:burn:tick", "weather:sandstorm:start"
+	payload?: any;
+}
 

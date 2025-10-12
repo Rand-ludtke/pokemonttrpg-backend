@@ -58,6 +58,10 @@ const turn1: MoveAction[] = [
 const res1 = engine.processTurn(turn1);
 console.log(`Turn ${res1.state.turn} events:`);
 for (const e of res1.events) console.log(" -", e);
+if (res1.anim?.length) {
+	console.log(`Turn ${res1.state.turn} anim:`);
+	for (const a of res1.anim) console.log(" *", a.type, a.payload ?? {});
+}
 
 // Turn 2: both use Tackle
 const turn2: MoveAction[] = [
@@ -82,4 +86,8 @@ const turn2: MoveAction[] = [
 const res2 = engine.processTurn(turn2);
 console.log(`\nTurn ${res2.state.turn} events:`);
 for (const e of res2.events) console.log(" -", e);
+if (res2.anim?.length) {
+	console.log(`Turn ${res2.state.turn} anim:`);
+	for (const a of res2.anim) console.log(" *", a.type, a.payload ?? {});
+}
 
