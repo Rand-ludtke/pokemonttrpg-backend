@@ -1,0 +1,50 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install and build project",
+			"type": "shell",
+			"command": "npm install",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "TypeScript build",
+			"type": "shell",
+			"command": "npx tsc -p tsconfig.json",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build TS after integration",
+			"type": "shell",
+			"command": "npx tsc -p tsconfig.json",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Rebuild after adapter improvements",
+			"type": "shell",
+			"command": "npx tsc -p tsconfig.json",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Rebuild after enhancements",
+			"type": "shell",
+			"command": "npx tsc -p tsconfig.json",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		}
+	]
+}

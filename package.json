@@ -1,0 +1,22 @@
+{
+	"name": "pokemonttrpg-backend",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Modular, event-driven battle engine for a Pokémon-style TTRPG.",
+	"license": "MIT",
+	"main": "dist/demo.js",
+	"types": "dist/index.d.ts",
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"start": "node dist/demo.js",
+		"dev": "ts-node ./src/demo.ts",
+		"test": "vitest run",
+		"test:watch": "vitest"
+	},
+	"devDependencies": {
+		"@types/node": "^20.11.30",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.4.5",
+		"vitest": "^1.6.0"
+	}
+}
