@@ -85,7 +85,8 @@ app.get("/api/rooms/:id/snapshot", (req: Request, res: Response) => {
   const room = rooms.get(req.params.id);
   if (!room || !room.engine) return res.status(404).json({ error: "room not found or battle not started" });
   const needsSwitch = room.forceSwitchNeeded ? Array.from(room.forceSwitchNeeded) : [];
-  res.json({ state: (room.engine as any)["state"], replay: room.replay, phase: room.phase ?? "normal", needsSwitch, deadline: room.forceSwitchDeadline ?? null });
+  const state = (room.engine as any)["state"] as import("../types").BattleState;
+  res.json({ state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch, deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
 });
 
 const server = http.createServer(app);
@@ -209,7 +210,8 @@ io.on("connection", (socket: Socket) => {
       room.spectators.push({ id: user.id, username: user.username, socketId: socket.id });
       // Send spectator snapshot if battle started
       if (room.battleStarted && room.engine) {
-        socket.emit("spectate_start", { state: (room.engine as any)["state"], replay: room.replay, phase: room.phase ?? "normal", needsSwitch: Array.from(room.forceSwitchNeeded ?? []), deadline: room.forceSwitchDeadline ?? null });
+  const state = (room.engine as any)["state"] as import("../types").BattleState;
+  socket.emit("spectate_start", { state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch: Array.from(room.forceSwitchNeeded ?? []), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
       }
     }
     io.to(room.id).emit("roomUpdate", summary(room));
@@ -247,7 +249,10 @@ io.on("connection", (socket: Socket) => {
       const res = room.engine.forceSwitch(data.playerId, (data.action as any).toIndex);
       room.replay.push({ turn: res.state.turn, events: res.events, anim: res.anim, phase: "force-switch" });
       room.forceSwitchNeeded.delete(data.playerId);
-      io.to(room.id).emit("battleUpdate", { result: res, needsSwitch: Array.from(room.forceSwitchNeeded), deadline: room.forceSwitchDeadline ?? null });
+      {
+        const s = (room.engine as any)["state"] as import("../types").BattleState;
+        io.to(room.id).emit("battleUpdate", { result: res, needsSwitch: Array.from(room.forceSwitchNeeded), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: s.field.room, magic: s.field.magicRoom, wonder: s.field.wonderRoom } });
+      }
       if (room.forceSwitchNeeded.size === 0) {
         room.phase = "normal";
         io.to(room.id).emit("phase", { phase: room.phase });
@@ -269,7 +274,7 @@ io.on("connection", (socket: Socket) => {
         io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
         startForceSwitchTimer(room);
       }
-      io.to(room.id).emit("battleUpdate", { result, needsSwitch });
+  io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
       // Simple end detection: if any player's active mon is fainted and no healthy mons remain
       const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));
       if (sideDefeated) {

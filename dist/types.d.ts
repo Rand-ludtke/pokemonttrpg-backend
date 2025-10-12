@@ -78,6 +78,9 @@ export interface SwitchAction extends ActionBase {
 export type Action = MoveAction | SwitchAction;
 export type WeatherId = "none" | "sun" | "rain" | "sandstorm" | "hail" | "snow";
 export type TerrainId = "none" | "electric" | "grassy" | "misty" | "psychic";
+export type RoomId = "none" | "trick_room";
+export type MagicRoomId = "none" | "magic_room";
+export type WonderRoomId = "none" | "wonder_room";
 export interface TimedFieldEffect<T extends string> {
     id: T;
     turnsLeft: number;
@@ -85,6 +88,9 @@ export interface TimedFieldEffect<T extends string> {
 export interface FieldState {
     weather: TimedFieldEffect<WeatherId>;
     terrain: TimedFieldEffect<TerrainId>;
+    room: TimedFieldEffect<RoomId>;
+    magicRoom: TimedFieldEffect<MagicRoomId>;
+    wonderRoom: TimedFieldEffect<WonderRoomId>;
 }
 export interface BattleState {
     turn: number;

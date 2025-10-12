@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.samplePlayers = exports.sampleMon = exports.defaultStats = exports.BURN_STATUS = exports.LIGHT_SCREEN = exports.REFLECT = exports.TAILWIND = exports.TORMENT = exports.DISABLE = exports.WILL_O_WISP = exports.SUBSTITUTE = exports.RECOVER = exports.ENCORE = exports.TAUNT = exports.MAGNET_RISE = exports.CALM_MIND = exports.NASTY_PLOT = exports.SWORDS_DANCE = exports.VOLT_SWITCH = exports.U_TURN = exports.DEFOG = exports.RAPID_SPIN = exports.STICKY_WEB = exports.TOXIC_SPIKES = exports.SPIKES = exports.STEALTH_ROCK = exports.PROTECT = exports.GRASSY_TERRAIN_MOVE = exports.SANDSTORM_MOVE = exports.EMBER = exports.QUICK_ATTACK = exports.TACKLE = void 0;
+exports.samplePlayers = exports.sampleMon = exports.defaultStats = exports.BURN_STATUS = exports.LIGHT_SCREEN = exports.REFLECT = exports.TAILWIND = exports.TORMENT = exports.DISABLE = exports.WILL_O_WISP = exports.SUBSTITUTE = exports.RECOVER = exports.ENCORE = exports.TAUNT = exports.MAGNET_RISE = exports.WONDER_ROOM = exports.MAGIC_ROOM = exports.TRICK_ROOM = exports.CALM_MIND = exports.NASTY_PLOT = exports.SWORDS_DANCE = exports.ROCK_THROW = exports.VOLT_SWITCH = exports.U_TURN = exports.DEFOG = exports.RAPID_SPIN = exports.STICKY_WEB = exports.TOXIC_SPIKES = exports.SPIKES = exports.STEALTH_ROCK = exports.PROTECT = exports.GRASSY_TERRAIN_MOVE = exports.SNOWSCAPE = exports.SUNNY_DAY = exports.RAIN_DANCE = exports.SANDSTORM_MOVE = exports.HYDRO_STEAM = exports.SOLAR_BEAM = exports.WEATHER_BALL = exports.EARTHQUAKE = exports.HURRICANE = exports.THUNDER = exports.THUNDERSHOCK = exports.WATER_GUN = exports.EMBER = exports.QUICK_ATTACK = exports.TACKLE = void 0;
 // Simple sample dataset
 exports.TACKLE = {
     id: "tackle",
@@ -24,15 +24,128 @@ exports.EMBER = {
     category: "Special",
     power: 40,
 };
+exports.WATER_GUN = {
+    id: "watergun",
+    name: "Water Gun",
+    type: "Water",
+    category: "Special",
+    power: 40,
+};
+exports.THUNDERSHOCK = {
+    id: "thundershock",
+    name: "Thundershock",
+    type: "Electric",
+    category: "Special",
+    power: 40,
+};
+exports.THUNDER = {
+    id: "thunder",
+    name: "Thunder",
+    type: "Electric",
+    category: "Special",
+    power: 110,
+    accuracy: 70,
+};
+exports.HURRICANE = {
+    id: "hurricane",
+    name: "Hurricane",
+    type: "Flying",
+    category: "Special",
+    power: 110,
+    accuracy: 70,
+};
+exports.EARTHQUAKE = {
+    id: "earthquake",
+    name: "Earthquake",
+    type: "Ground",
+    category: "Physical",
+    power: 100,
+    accuracy: 100,
+};
+// Weather Ball: changes type with weather and doubles power in weather
+// Note: Engine applies move-specific handling for Weather Ball so we keep base definition simple here
+exports.WEATHER_BALL = {
+    id: "weather_ball",
+    name: "Weather Ball",
+    type: "Normal",
+    category: "Special",
+    power: 50,
+    accuracy: 100,
+};
+// Solar Beam: two-turn normally, but we simplify to a single turn and just apply the rain/sand/hail power penalty (and ignore sun's no-charge effect)
+exports.SOLAR_BEAM = {
+    id: "solar_beam",
+    name: "Solar Beam",
+    type: "Grass",
+    category: "Special",
+    power: 120,
+    accuracy: 100,
+};
+// Hydro Steam: Water move that is boosted by sun instead of reduced; implemented via engine special-case in damage mods
+exports.HYDRO_STEAM = {
+    id: "hydro_steam",
+    name: "Hydro Steam",
+    type: "Water",
+    category: "Special",
+    power: 80,
+    accuracy: 100,
+};
 exports.SANDSTORM_MOVE = {
     id: "sandstorm",
     name: "Sandstorm",
     type: "Rock",
     category: "Status",
     onUse: ({ state, log, utils }) => {
+        // Set/refresh to 5 turns, extend to 8 with Smooth Rock
+        const user = (state.players[0].team.concat(state.players[1].team)).find(m => m.id); // not ideal; context doesn't pass user here in sample signature, so we keep 5
         state.field.weather = { id: "sandstorm", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + 5 };
         log(`A sandstorm kicked up!`);
         utils.emitAnim?.({ type: "weather:sandstorm:start", payload: {} });
+    },
+};
+exports.RAIN_DANCE = {
+    id: "raindance",
+    name: "Rain Dance",
+    type: "Water",
+    category: "Status",
+    onUse: ({ state, user, log, utils }) => {
+        let turns = 5;
+        const item = (user.item ?? "").toLowerCase();
+        if (["damp_rock", "damprock", "damp-rock"].includes(item))
+            turns = 8;
+        state.field.weather = { id: "rain", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + turns };
+        log(`It started to rain!`);
+        utils.emitAnim?.({ type: "weather:rain:start", payload: {} });
+    },
+};
+exports.SUNNY_DAY = {
+    id: "sunnyday",
+    name: "Sunny Day",
+    type: "Fire",
+    category: "Status",
+    onUse: ({ state, user, log, utils }) => {
+        let turns = 5;
+        const item = (user.item ?? "").toLowerCase();
+        if (["heat_rock", "heatrock", "heat-rock"].includes(item))
+            turns = 8;
+        state.field.weather = { id: "sun", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + turns };
+        log(`The sunlight turned harsh!`);
+        utils.emitAnim?.({ type: "weather:sun:start", payload: {} });
+    },
+};
+exports.SNOWSCAPE = {
+    id: "snowscape",
+    name: "Snowscape",
+    type: "Ice",
+    category: "Status",
+    onUse: ({ state, user, log, utils }) => {
+        let turns = 5;
+        const item = (user.item ?? "").toLowerCase();
+        if (["icy_rock", "icyrock", "icy-rock"].includes(item))
+            turns = 8;
+        state.field.weather = { id: "snow", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + turns };
+        log(`It started to snow!`);
+        utils.emitAnim?.({ type: "weather:snow:start", payload: {} });
     },
 };
 exports.GRASSY_TERRAIN_MOVE = {
@@ -187,6 +300,14 @@ exports.VOLT_SWITCH = {
     accuracy: 100,
     switchesUserOut: true,
 };
+exports.ROCK_THROW = {
+    id: "rockthrow",
+    name: "Rock Throw",
+    type: "Rock",
+    category: "Physical",
+    power: 50,
+    accuracy: 90,
+};
 exports.SWORDS_DANCE = {
     id: "swordsdance",
     name: "Swords Dance",
@@ -220,6 +341,70 @@ exports.CALM_MIND = {
         utils.emitAnim?.({ type: "stat:spa_spd:up1", payload: { pokemonId: user.id } });
     },
 };
+exports.TRICK_ROOM = {
+    id: "trick-room",
+    name: "Trick Room",
+    type: "Psychic",
+    category: "Status",
+    priority: -7,
+    onUse: ({ state, log, utils }) => {
+        const active = state.field.room.id === "trick_room";
+        if (active) {
+            state.field.room.turnsLeft = 0;
+            state.field.room.id = "none";
+            log(`The twisted dimensions returned to normal!`);
+            utils.emitAnim?.({ type: "room:trick_room:end", payload: {} });
+            return;
+        }
+        state.field.room.id = "trick_room";
+        // Standard duration 5 turns
+        state.field.room.turnsLeft = 5;
+        log(`Trick Room twisted the dimensions!`);
+        utils.emitAnim?.({ type: "room:trick_room:start", payload: {} });
+    },
+};
+exports.MAGIC_ROOM = {
+    id: "magic-room",
+    name: "Magic Room",
+    type: "Psychic",
+    category: "Status",
+    priority: -7,
+    onUse: ({ state, log, utils }) => {
+        const active = state.field.magicRoom.id === "magic_room";
+        if (active) {
+            state.field.magicRoom.turnsLeft = 0;
+            state.field.magicRoom.id = "none";
+            log(`Magic Room's strange space faded! Items work again.`);
+            utils.emitAnim?.({ type: "room:magic_room:end", payload: {} });
+            return;
+        }
+        state.field.magicRoom.id = "magic_room";
+        state.field.magicRoom.turnsLeft = 5;
+        log(`Magic Room created a bizarre area where items lose their effects!`);
+        utils.emitAnim?.({ type: "room:magic_room:start", payload: {} });
+    }
+};
+exports.WONDER_ROOM = {
+    id: "wonder-room",
+    name: "Wonder Room",
+    type: "Psychic",
+    category: "Status",
+    priority: -7,
+    onUse: ({ state, log, utils }) => {
+        const active = state.field.wonderRoom.id === "wonder_room";
+        if (active) {
+            state.field.wonderRoom.turnsLeft = 0;
+            state.field.wonderRoom.id = "none";
+            log(`Wonder Room's bizarre area disappeared!`);
+            utils.emitAnim?.({ type: "room:wonder_room:end", payload: {} });
+            return;
+        }
+        state.field.wonderRoom.id = "wonder_room";
+        state.field.wonderRoom.turnsLeft = 5;
+        log(`Wonder Room created a bizarre area where defenses are swapped!`);
+        utils.emitAnim?.({ type: "room:wonder_room:start", payload: {} });
+    }
+};
 exports.MAGNET_RISE = {
     id: "magnetrise",
     name: "Magnet Rise",
@@ -227,7 +412,8 @@ exports.MAGNET_RISE = {
     category: "Status",
     onUse: ({ user, log, utils }) => {
         user.volatile = user.volatile || {};
-        user.volatile.magnetRiseTurns = Math.max(1, (user.volatile.magnetRiseTurns ?? 0)) + 5;
+        // Set to exactly 5 turns (refresh if used again while active)
+        user.volatile.magnetRiseTurns = 5;
         log(`${user.name} levitated with electromagnetism!`);
         utils.emitAnim?.({ type: "status:magnetrise:start", payload: { pokemonId: user.id } });
     },

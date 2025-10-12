@@ -76,7 +76,85 @@ export const Abilities: Record<string, Ability> = {
     name: "Pressure",
     // PP drain handled in engine when target has Pressure
   },
+  drizzle: {
+    id: "drizzle",
+    name: "Drizzle",
+    onSwitchIn: (pokemon, state, log) => {
+      let turns = 5;
+      if (pokemon.item && state && state) {
+        // If holding Damp Rock, extend to 8
+        turns = (require("../items") as any).Items[pokemon.item]?.onWeatherDuration?.("rain", turns) ?? turns;
+      }
+      state.field.weather = { id: "rain", turnsLeft: turns } as any;
+      log(`It started to rain!`);
+    },
+  },
+  drought: {
+    id: "drought",
+    name: "Drought",
+    onSwitchIn: (pokemon, state, log) => {
+      let turns = 5;
+      if (pokemon.item && state && state) {
+        turns = (require("../items") as any).Items[pokemon.item]?.onWeatherDuration?.("sun", turns) ?? turns;
+      }
+      state.field.weather = { id: "sun", turnsLeft: turns } as any;
+      log(`The sunlight turned harsh!`);
+    },
+  },
+  sand_stream: {
+    id: "sand_stream",
+    name: "Sand Stream",
+    onSwitchIn: (pokemon, state, log) => {
+      let turns = 5;
+      if (pokemon.item && state && state) {
+        turns = (require("../items") as any).Items[pokemon.item]?.onWeatherDuration?.("sandstorm", turns) ?? turns;
+      }
+      state.field.weather = { id: "sandstorm", turnsLeft: turns } as any;
+      log(`A sandstorm kicked up!`);
+    },
+  },
+  snow_warning: {
+    id: "snow_warning",
+    name: "Snow Warning",
+    onSwitchIn: (pokemon, state, log) => {
+      let turns = 5;
+      if (pokemon.item && state && state) {
+        turns = (require("../items") as any).Items[pokemon.item]?.onWeatherDuration?.("snow", turns) ?? turns;
+      }
+      state.field.weather = { id: "snow", turnsLeft: turns } as any;
+      log(`It started to snow!`);
+    },
+  },
+  cloud_nine: {
+    id: "cloud_nine",
+    name: "Cloud Nine",
+  },
+  air_lock: {
+    id: "air_lock",
+    name: "Air Lock",
+  },
   // Guts: increases Attack by 50% if statused (simplified applied in getEffectiveAttack)
+  rain_dish: {
+    id: "rain_dish",
+    name: "Rain Dish",
+    onSwitchIn: (pokemon, state, log) => {},
+  },
+  solar_power: {
+    id: "solar_power",
+    name: "Solar Power",
+  },
+  sand_force: {
+    id: "sand_force",
+    name: "Sand Force",
+  },
+  slush_rush: {
+    id: "slush_rush",
+    name: "Slush Rush",
+    onModifySpeed: (pokemon, speed) => speed, // doubled in snow handled in engine
+  },
+  overcoat: { id: "overcoat", name: "Overcoat" },
+  ice_body: { id: "ice_body", name: "Ice Body" },
+  snow_cloak: { id: "snow_cloak", name: "Snow Cloak" },
 };
 
 export function mergeAbilities(map: Record<string, Ability>) {

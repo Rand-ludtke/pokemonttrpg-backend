@@ -24,6 +24,8 @@ export declare class Engine implements BattleRuleset {
     onSwitchIn(handler: Handler<[Pokemon, BattleState, LogSink]>): void;
     private rng;
     private getPokemonById;
+    private isWeatherSuppressed;
+    private areItemsSuppressed;
     private isGrounded;
     private compareActions;
     private actionPriority;

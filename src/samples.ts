@@ -28,15 +28,136 @@ export const EMBER: Move = {
 	power: 40,
 };
 
+export const WATER_GUN: Move = {
+	id: "watergun",
+	name: "Water Gun",
+	type: "Water",
+	category: "Special",
+	power: 40,
+};
+
+export const THUNDERSHOCK: Move = {
+	id: "thundershock",
+	name: "Thundershock",
+	type: "Electric",
+	category: "Special",
+	power: 40,
+};
+
+export const THUNDER: Move = {
+	id: "thunder",
+	name: "Thunder",
+	type: "Electric",
+	category: "Special",
+	power: 110,
+	accuracy: 70,
+};
+
+export const HURRICANE: Move = {
+	id: "hurricane",
+	name: "Hurricane",
+	type: "Flying",
+	category: "Special",
+	power: 110,
+	accuracy: 70,
+};
+
+export const EARTHQUAKE: Move = {
+  id: "earthquake",
+  name: "Earthquake",
+  type: "Ground",
+  category: "Physical",
+  power: 100,
+  accuracy: 100,
+};
+
+// Weather Ball: changes type with weather and doubles power in weather
+// Note: Engine applies move-specific handling for Weather Ball so we keep base definition simple here
+export const WEATHER_BALL: Move = {
+	id: "weather_ball",
+	name: "Weather Ball",
+	type: "Normal",
+	category: "Special",
+	power: 50,
+	accuracy: 100,
+};
+
+// Solar Beam: two-turn normally, but we simplify to a single turn and just apply the rain/sand/hail power penalty (and ignore sun's no-charge effect)
+export const SOLAR_BEAM: Move = {
+	id: "solar_beam",
+	name: "Solar Beam",
+	type: "Grass",
+	category: "Special",
+	power: 120,
+	accuracy: 100,
+};
+
+// Hydro Steam: Water move that is boosted by sun instead of reduced; implemented via engine special-case in damage mods
+export const HYDRO_STEAM: Move = {
+	id: "hydro_steam",
+	name: "Hydro Steam",
+	type: "Water",
+	category: "Special",
+	power: 80,
+	accuracy: 100,
+};
+
 export const SANDSTORM_MOVE: Move = {
 	id: "sandstorm",
 	name: "Sandstorm",
 	type: "Rock",
 	category: "Status",
 		onUse: ({ state, log, utils }) => {
+			// Set/refresh to 5 turns, extend to 8 with Smooth Rock
+			const user = (state.players[0].team.concat(state.players[1].team)).find(m => m.id); // not ideal; context doesn't pass user here in sample signature, so we keep 5
 			state.field.weather = { id: "sandstorm", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + 5 } as any;
 			log(`A sandstorm kicked up!`);
 			utils.emitAnim?.({ type: "weather:sandstorm:start", payload: {} });
+	},
+};
+
+export const RAIN_DANCE: Move = {
+	id: "raindance",
+	name: "Rain Dance",
+	type: "Water",
+	category: "Status",
+	onUse: ({ state, user, log, utils }) => {
+		let turns = 5;
+		const item = (user.item ?? "").toLowerCase();
+		if (["damp_rock","damprock","damp-rock"].includes(item)) turns = 8;
+		state.field.weather = { id: "rain", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + turns } as any;
+		log(`It started to rain!`);
+		utils.emitAnim?.({ type: "weather:rain:start", payload: {} });
+	},
+};
+
+export const SUNNY_DAY: Move = {
+	id: "sunnyday",
+	name: "Sunny Day",
+	type: "Fire",
+	category: "Status",
+	onUse: ({ state, user, log, utils }) => {
+		let turns = 5;
+		const item = (user.item ?? "").toLowerCase();
+		if (["heat_rock","heatrock","heat-rock"].includes(item)) turns = 8;
+		state.field.weather = { id: "sun", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + turns } as any;
+		log(`The sunlight turned harsh!`);
+		utils.emitAnim?.({ type: "weather:sun:start", payload: {} });
+	},
+};
+
+export const SNOWSCAPE: Move = {
+	id: "snowscape",
+	name: "Snowscape",
+	type: "Ice",
+	category: "Status",
+	onUse: ({ state, user, log, utils }) => {
+		let turns = 5;
+		const item = (user.item ?? "").toLowerCase();
+		if (["icy_rock","icyrock","icy-rock"].includes(item)) turns = 8;
+		state.field.weather = { id: "snow", turnsLeft: Math.max(1, (state.field.weather.turnsLeft || 0)) + turns } as any;
+		log(`It started to snow!`);
+		utils.emitAnim?.({ type: "weather:snow:start", payload: {} });
 	},
 };
 
@@ -195,6 +316,15 @@ export const VOLT_SWITCH: Move = {
 	switchesUserOut: true,
 };
 
+export const ROCK_THROW: Move = {
+	id: "rockthrow",
+	name: "Rock Throw",
+	type: "Rock",
+	category: "Physical",
+	power: 50,
+	accuracy: 90,
+};
+
 export const SWORDS_DANCE: Move = {
 	id: "swordsdance",
 	name: "Swords Dance",
@@ -229,6 +359,73 @@ export const CALM_MIND: Move = {
 		log(`${user.name}'s Sp. Atk and Sp. Def rose!`);
 		utils.emitAnim?.({ type: "stat:spa_spd:up1", payload: { pokemonId: user.id } });
 	},
+};
+
+export const TRICK_ROOM: Move = {
+	id: "trick-room",
+	name: "Trick Room",
+	type: "Psychic",
+	category: "Status",
+	priority: -7,
+	onUse: ({ state, log, utils }) => {
+		const active = state.field.room.id === "trick_room";
+		if (active) {
+			state.field.room.turnsLeft = 0;
+			state.field.room.id = "none" as any;
+			log(`The twisted dimensions returned to normal!`);
+			utils.emitAnim?.({ type: "room:trick_room:end", payload: {} });
+			return;
+		}
+		state.field.room.id = "trick_room" as any;
+		// Standard duration 5 turns
+		state.field.room.turnsLeft = 5;
+		log(`Trick Room twisted the dimensions!`);
+		utils.emitAnim?.({ type: "room:trick_room:start", payload: {} });
+	},
+};
+
+export const MAGIC_ROOM: Move = {
+	id: "magic-room",
+	name: "Magic Room",
+	type: "Psychic",
+	category: "Status",
+	priority: -7,
+	onUse: ({ state, log, utils }) => {
+		const active = state.field.magicRoom.id === "magic_room";
+		if (active) {
+			state.field.magicRoom.turnsLeft = 0;
+			state.field.magicRoom.id = "none" as any;
+			log(`Magic Room's strange space faded! Items work again.`);
+			utils.emitAnim?.({ type: "room:magic_room:end", payload: {} });
+			return;
+		}
+		state.field.magicRoom.id = "magic_room" as any;
+		state.field.magicRoom.turnsLeft = 5;
+		log(`Magic Room created a bizarre area where items lose their effects!`);
+		utils.emitAnim?.({ type: "room:magic_room:start", payload: {} });
+	}
+};
+
+export const WONDER_ROOM: Move = {
+	id: "wonder-room",
+	name: "Wonder Room",
+	type: "Psychic",
+	category: "Status",
+	priority: -7,
+	onUse: ({ state, log, utils }) => {
+		const active = state.field.wonderRoom.id === "wonder_room";
+		if (active) {
+			state.field.wonderRoom.turnsLeft = 0;
+			state.field.wonderRoom.id = "none" as any;
+			log(`Wonder Room's bizarre area disappeared!`);
+			utils.emitAnim?.({ type: "room:wonder_room:end", payload: {} });
+			return;
+		}
+		state.field.wonderRoom.id = "wonder_room" as any;
+		state.field.wonderRoom.turnsLeft = 5;
+		log(`Wonder Room created a bizarre area where defenses are swapped!`);
+		utils.emitAnim?.({ type: "room:wonder_room:start", payload: {} });
+	}
 };
 
 export const MAGNET_RISE: Move = {

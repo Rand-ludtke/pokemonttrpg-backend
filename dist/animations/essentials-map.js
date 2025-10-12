@@ -19,6 +19,10 @@ function mapAnimationEventToEssentials(ev) {
             return { key: "Pokemon/Faint", params: { pokemonId: ev.payload?.pokemonId } };
         case "switch":
             return { key: "Pokemon/SendOut", params: { playerId: ev.payload?.playerId, pokemonId: ev.payload?.pokemonId } };
+        case "move:blocked":
+            return { key: "Moves/Blocked", params: { targetId: ev.payload?.targetId } };
+        case "move:charge":
+            return { key: "Moves/Charge", params: { userId: ev.payload?.userId, moveId: ev.payload?.moveId } };
         case "weather:sandstorm:tick":
             return { key: "Weather/SandstormTick", params: { pokemonId: ev.payload?.pokemonId, damage: ev.payload?.damage } };
         case "weather:sandstorm:start":
@@ -35,6 +39,12 @@ function mapAnimationEventToEssentials(ev) {
             return { key: "Items/FocusSash", params: { pokemonId: ev.payload?.pokemonId } };
         case "survive:sturdy":
             return { key: "Abilities/Sturdy", params: { pokemonId: ev.payload?.pokemonId } };
+        case "ability:flash-fire":
+            return { key: "Abilities/FlashFire", params: { pokemonId: ev.payload?.pokemonId } };
+        case "item:life-orb:recoil":
+            return { key: "Items/LifeOrb", params: { pokemonId: ev.payload?.pokemonId, damage: ev.payload?.damage } };
+        case "item:air-balloon:pop":
+            return { key: "Items/AirBalloonPop", params: { pokemonId: ev.payload?.pokemonId } };
         default:
             return null;
     }

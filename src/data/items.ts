@@ -63,6 +63,30 @@ export const Items: Record<string, Item> = {
     id: "light_clay",
     name: "Light Clay",
   },
+  damp_rock: {
+    id: "damp_rock",
+    name: "Damp Rock",
+    onWeatherDuration: (weatherId, current) => (weatherId === "rain" ? 8 : current),
+  },
+  heat_rock: {
+    id: "heat_rock",
+    name: "Heat Rock",
+    onWeatherDuration: (weatherId, current) => (weatherId === "sun" ? 8 : current),
+  },
+  smooth_rock: {
+    id: "smooth_rock",
+    name: "Smooth Rock",
+    onWeatherDuration: (weatherId, current) => (weatherId === "sandstorm" ? 8 : current),
+  },
+  icy_rock: {
+    id: "icy_rock",
+    name: "Icy Rock",
+    onWeatherDuration: (weatherId, current) => (weatherId === "hail" || weatherId === "snow" ? 8 : current),
+  },
+  utility_umbrella: {
+    id: "utility_umbrella",
+    name: "Utility Umbrella",
+  },
 };
 
 export function mergeItems(map: Record<string, Item>) {

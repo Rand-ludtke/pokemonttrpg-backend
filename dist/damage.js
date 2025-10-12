@@ -11,6 +11,9 @@ function calcDamage(user, target, move, atk, def, env) {
     const base = Math.floor((((2 * level) / 5 + 2) * power * atk) / Math.max(1, def) / 50) + 2;
     const stab = user.types.includes(move.type) ? 1.5 : 1;
     const eff = (0, type_chart_1.typeEffectiveness)(move.type, target.types);
+    if (eff === 0) {
+        return { damage: 0, effectiveness: eff, stab, roll: 1 };
+    }
     const roll = 0.85 + env.rng() * 0.15; // 0.85..1.0
     const dmg = Math.max(1, Math.floor(base * stab * eff * roll));
     return { damage: dmg, effectiveness: eff, stab, roll };

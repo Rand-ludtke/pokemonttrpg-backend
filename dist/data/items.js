@@ -35,17 +35,7 @@ exports.Items = {
         id: "life_orb",
         name: "Life Orb",
         onModifyDamage: (_pokemon, damage) => Math.floor(damage * 1.3),
-        onEndOfTurn: (pokemon, _state, log) => {
-            if (pokemon.currentHP <= 0)
-                return;
-            // recoil 10% max HP if it attacked; simplified to always apply when holding LO
-            const recoil = Math.max(1, Math.floor(pokemon.maxHP / 10));
-            const before = pokemon.currentHP;
-            pokemon.currentHP = Math.max(0, pokemon.currentHP - recoil);
-            const delta = before - pokemon.currentHP;
-            if (delta > 0)
-                log(`${pokemon.name} is hurt by Life Orb! (-${delta})`);
-        },
+        // Recoil is applied post-move in engine when damage was dealt; no EOT effect here
     },
     choice_scarf: {
         id: "choice_scarf",
@@ -65,6 +55,30 @@ exports.Items = {
     light_clay: {
         id: "light_clay",
         name: "Light Clay",
+    },
+    damp_rock: {
+        id: "damp_rock",
+        name: "Damp Rock",
+        onWeatherDuration: (weatherId, current) => (weatherId === "rain" ? 8 : current),
+    },
+    heat_rock: {
+        id: "heat_rock",
+        name: "Heat Rock",
+        onWeatherDuration: (weatherId, current) => (weatherId === "sun" ? 8 : current),
+    },
+    smooth_rock: {
+        id: "smooth_rock",
+        name: "Smooth Rock",
+        onWeatherDuration: (weatherId, current) => (weatherId === "sandstorm" ? 8 : current),
+    },
+    icy_rock: {
+        id: "icy_rock",
+        name: "Icy Rock",
+        onWeatherDuration: (weatherId, current) => (weatherId === "hail" || weatherId === "snow" ? 8 : current),
+    },
+    utility_umbrella: {
+        id: "utility_umbrella",
+        name: "Utility Umbrella",
     },
 };
 function mergeItems(map) {

@@ -45,6 +45,9 @@ export class Engine implements BattleRuleset {
 			field: {
 				weather: { id: "none", turnsLeft: 0 },
 				terrain: { id: "none", turnsLeft: 0 },
+				room: { id: "none", turnsLeft: 0 },
+				magicRoom: { id: "none", turnsLeft: 0 },
+				wonderRoom: { id: "none", turnsLeft: 0 },
 			},
 			log: [],
 		};
@@ -95,7 +98,7 @@ export class Engine implements BattleRuleset {
 		// Filter fainted actors and illegal actions
 		const legalActions = actions.filter((a) => this.getPokemonById(a.pokemonId)?.currentHP! > 0);
 
-		// Sort by priority then speed
+		// Sort by priority then speed (reverse speed under Trick Room)
 		const sorted = [...legalActions].sort((a, b) => this.compareActions(a, b));
 
 		// Execute
@@ -149,10 +152,10 @@ export class Engine implements BattleRuleset {
 				actor.volatile = actor.volatile || {};
 				(actor.volatile as any).pp = (actor.volatile as any).pp || {};
 				const ppStore = (actor.volatile as any).pp as Record<string, number>;
-				// Choice item lock enforcement: if holding a Choice item and locked, block other moves
+				// Choice item lock enforcement: if holding a Choice item and locked, block other moves (ignored under Magic Room)
 				const hasChoice = ["choice_band","choice_specs","choice_scarf"].includes((actor.item ?? "").toLowerCase());
 				const lockedId = (actor.volatile as any).choiceLockedMoveId as string | undefined;
-				if (hasChoice && lockedId && requested && requested.id !== lockedId) {
+				if (!this.areItemsSuppressed() && hasChoice && lockedId && requested && requested.id !== lockedId) {
 					// Allow Struggle fallback path to handle when no PP remains on any move; otherwise block
 					log(`${actor.name} is locked into ${lockedId} due to its Choice item!`);
 					continue;
@@ -219,19 +222,23 @@ export class Engine implements BattleRuleset {
 					log(`${actor.name} was hurt by recoil! (-${selfDmg})`);
 					anim.push({ type: "move:recoil", payload: { userId: actor.id, damage: selfDmg } });
 				}
-				// Set Choice lock after first successful move (skip Struggle)
-				if (!usingStruggle && hasChoice && !(actor.volatile as any).choiceLockedMoveId) {
+				// Set Choice lock after first successful move (skip Struggle) unless items are suppressed
+				if (!usingStruggle && hasChoice && !(actor.volatile as any).choiceLockedMoveId && !this.areItemsSuppressed()) {
 					(actor.volatile as any).choiceLockedMoveId = move.id;
 				}
 				// Decrement PP only on successful execution (skip for Struggle). Pressure causes -2 per use.
 				if (!usingStruggle) {
-					let dec = 1;
-					const targetHasPressure = (target.ability === "pressure");
-					if (targetHasPressure) dec = 2;
-					ppStore[move.id] = Math.max(0, (ppStore[move.id] ?? basePP) - dec);
+					if ((actor.volatile as any).skipPPThisAction) {
+						(actor.volatile as any).skipPPThisAction = false;
+					} else {
+						let dec = 1;
+						const targetHasPressure = (target.ability === "pressure");
+						if (targetHasPressure) dec = 2;
+						ppStore[move.id] = Math.max(0, (ppStore[move.id] ?? basePP) - dec);
+					}
 				}
-				// Life Orb recoil only if a damaging move dealt damage this turn (handled in executeMove via anim? we check damage dealt by examining last pushed move:hit anim)
-				if (actor.item === "life_orb" && move.category !== "Status") {
+				// Life Orb recoil only if a damaging move dealt damage this turn, unless items are suppressed
+				if (!this.areItemsSuppressed() && actor.item === "life_orb" && move.category !== "Status") {
 					// naive check: if target took any damage this action (totalDealt tracked? we infer by lastMoveId + target hp change)
 					// Simpler: emit a marker on actor when executeMove dealt damage; read and clear here
 					if ((actor.volatile as any).dealtDamageThisAction) {
@@ -272,7 +279,31 @@ export class Engine implements BattleRuleset {
 		for (const p of this.state.players) {
 			const mon = p.team[p.activeIndex];
 			if (mon.currentHP > 0) this.emitStatusTick(mon, mon.status, log);
-					if (mon.item && Items[mon.item]?.onEndOfTurn) Items[mon.item].onEndOfTurn!(mon, this.state, log);
+					if (!this.areItemsSuppressed() && mon.item && Items[mon.item]?.onEndOfTurn) Items[mon.item].onEndOfTurn!(mon, this.state, log);
+					// Weather ability EOT: Rain Dish heal, Solar Power chip
+					if (!this.isWeatherSuppressed() && mon.currentHP > 0) {
+						const w = this.state.field.weather.id;
+						const monUmbrella = !this.areItemsSuppressed() && ((mon.item ?? "").toLowerCase() === "utility_umbrella");
+						if (w === "rain" && mon.ability === "rain_dish" && !monUmbrella) {
+							const heal = Math.max(1, Math.floor(mon.maxHP / 16));
+							const before = mon.currentHP;
+							mon.currentHP = Math.min(mon.maxHP, mon.currentHP + heal);
+							const delta = mon.currentHP - before;
+							if (delta > 0) log(`${mon.name} restored HP with Rain Dish. (+${delta})`);
+						}
+						if (w === "sun" && mon.ability === "solar_power" && !monUmbrella) {
+							const dmg = Math.max(1, Math.floor(mon.maxHP / 8));
+							mon.currentHP = Math.max(0, mon.currentHP - dmg);
+							log(`${mon.name} was hurt by Solar Power. (-${dmg})`);
+						}
+						if ((w === "hail" || w === "snow") && mon.ability === "ice_body") {
+							const heal = Math.max(1, Math.floor(mon.maxHP / 16));
+							const before = mon.currentHP;
+							mon.currentHP = Math.min(mon.maxHP, mon.currentHP + heal);
+							const delta = mon.currentHP - before;
+							if (delta > 0) log(`${mon.name} restored HP with Ice Body. (+${delta})`);
+						}
+					}
 				// Clear one-turn volatiles like Protect
 				if (mon.volatile) {
 					if ((mon.volatile as any).protect) {
@@ -359,10 +390,12 @@ export class Engine implements BattleRuleset {
 			}
 
 			// Weather residuals (very simplified)
-			if (this.state.field.weather.id === "sandstorm") {
+			if (!this.isWeatherSuppressed() && this.state.field.weather.id === "sandstorm") {
 				for (const pl of this.state.players) {
 					const mon = pl.team[pl.activeIndex];
 					if (mon.currentHP <= 0) continue;
+					// Overcoat prevents weather chip; Umbrella does not affect hail/snow
+					if (mon.ability === "overcoat") continue;
 					// Rock/Ground/Steel immune
 					if (mon.types.some((t) => t === "Rock" || t === "Ground" || t === "Steel")) continue;
 					const dmg = Math.max(1, Math.floor(mon.maxHP / 16));
@@ -371,6 +404,21 @@ export class Engine implements BattleRuleset {
 					anim.push({ type: "weather:sandstorm:tick", payload: { pokemonId: mon.id, damage: dmg } });
 				}
 			}
+
+			// Hail residuals: chip non-Ice types (classic behavior), distinct from Gen9 Snow
+			if (!this.isWeatherSuppressed() && this.state.field.weather.id === "hail") {
+				for (const pl of this.state.players) {
+					const mon = pl.team[pl.activeIndex];
+					if (mon.currentHP <= 0) continue;
+					if (mon.ability === "overcoat") continue;
+					if (mon.types.includes("Ice")) continue;
+					const dmg = Math.max(1, Math.floor(mon.maxHP / 16));
+					mon.currentHP = Math.max(0, mon.currentHP - dmg);
+					log(`${mon.name} is pelted by hail! (${dmg})`);
+					anim.push({ type: "weather:hail:tick", payload: { pokemonId: mon.id, damage: dmg } });
+				}
+			}
+
 
 			// Terrain residuals (Grassy Terrain heal simplified)
 			if (this.state.field.terrain.id === "grassy") {
@@ -389,8 +437,14 @@ export class Engine implements BattleRuleset {
 			// Decrement durations with end notifications
 			const prevWeather = { ...this.state.field.weather };
 			const prevTerrain = { ...this.state.field.terrain };
+			const prevRoom = { ...this.state.field.room };
+			const prevMagic = { ...this.state.field.magicRoom };
+			const prevWonder = { ...this.state.field.wonderRoom };
 			if (this.state.field.weather.turnsLeft > 0) this.state.field.weather.turnsLeft -= 1;
 			if (this.state.field.terrain.turnsLeft > 0) this.state.field.terrain.turnsLeft -= 1;
+			if (this.state.field.room.turnsLeft > 0) this.state.field.room.turnsLeft -= 1;
+			if (this.state.field.magicRoom.turnsLeft > 0) this.state.field.magicRoom.turnsLeft -= 1;
+			if (this.state.field.wonderRoom.turnsLeft > 0) this.state.field.wonderRoom.turnsLeft -= 1;
 			if (prevWeather.id !== "none" && prevWeather.turnsLeft === 1) {
 				// ended now
 				log(`${prevWeather.id} weather subsided.`);
@@ -401,6 +455,21 @@ export class Engine implements BattleRuleset {
 				log(`The ${prevTerrain.id} terrain faded.`);
 				anim.push({ type: `terrain:${prevTerrain.id}:end`, payload: {} });
 				this.state.field.terrain.id = "none";
+			}
+			if (prevRoom.id !== "none" && prevRoom.turnsLeft === 1) {
+				log(`Trick Room twisted the dimensions back to normal.`);
+				anim.push({ type: `room:trick_room:end`, payload: {} });
+				this.state.field.room.id = "none";
+			}
+			if (prevMagic.id !== "none" && prevMagic.turnsLeft === 1) {
+				log(`Magic Room's aura faded. Items work normally again.`);
+				anim.push({ type: `room:magic_room:end`, payload: {} });
+				this.state.field.magicRoom.id = "none";
+			}
+			if (prevWonder.id !== "none" && prevWonder.turnsLeft === 1) {
+				log(`Wonder Room's bizarre area disappeared. Defenses swapped back.`);
+				anim.push({ type: `room:wonder_room:end`, payload: {} });
+				this.state.field.wonderRoom.id = "none";
 			}
 
 			// Side conditions timers: Tailwind, Reflect, Light Screen
@@ -458,6 +527,20 @@ export class Engine implements BattleRuleset {
 		return undefined;
 	}
 
+	private isWeatherSuppressed(): boolean {
+		// Suppressed if any active Pokémon has Cloud Nine or Air Lock
+		for (const pl of this.state.players) {
+			const mon = pl.team[pl.activeIndex];
+			const abil = (mon.ability ?? "").toLowerCase();
+			if (abil === "cloud_nine" || abil === "cloudnine" || abil === "air_lock" || abil === "airlock") return true;
+		}
+		return false;
+	}
+
+	private areItemsSuppressed(): boolean {
+		return this.state.field.magicRoom.id === "magic_room";
+	}
+
 	private isGrounded(p: Pokemon): boolean {
 		// Flying-types are not grounded
 		if (p.types.includes("Flying")) return false;
@@ -465,7 +548,7 @@ export class Engine implements BattleRuleset {
 		if ((p.volatile?.magnetRiseTurns ?? 0) > 0) return false;
 		// Air Balloon item
 		const item = (p.item ?? "").toLowerCase();
-		if (["air_balloon", "airballoon", "air-balloon"].includes(item)) return false;
+		if (!this.areItemsSuppressed() && ["air_balloon", "airballoon", "air-balloon"].includes(item)) return false;
 		return true;
 	}
 
@@ -478,7 +561,7 @@ export class Engine implements BattleRuleset {
 		// Speed tiebreaker
 		const speA = this.actionSpeed(a);
 		const speB = this.actionSpeed(b);
-		if (speA !== speB) return speB - speA; // faster first
+		if (speA !== speB) return speB - speA; // higher first (note: actionSpeed accounts for Trick Room)
 
 		// Random tie-break
 		return this.rng() < 0.5 ? -1 : 1;
@@ -495,7 +578,10 @@ export class Engine implements BattleRuleset {
 
 	private actionSpeed(a: Action): number {
 		const actor = this.getPokemonById(a.pokemonId);
-		return actor ? this.getEffectiveSpeed(actor) : 0;
+		if (!actor) return 0;
+		const base = this.getEffectiveSpeed(actor);
+		const trick = this.state.field.room.id === "trick_room";
+		return trick ? -base : base;
 	}
 
 		private executeMove(move: Move, user: Pokemon, target: Pokemon, log: LogSink) {
@@ -512,15 +598,68 @@ export class Engine implements BattleRuleset {
 				(this as any)._pushAnim?.({ type: "move:blocked", payload: { targetId: target.id } });
 				return;
 			}
+			// Move overrides before accuracy/damage (Weather Ball adapts to weather; Solar Beam charge)
+			let executingMove: Move = { ...move };
+			if (!this.isWeatherSuppressed() && move.id === "weather_ball") {
+				const w = this.state.field.weather.id;
+				if (w === "sun") executingMove.type = "Fire";
+				else if (w === "rain") executingMove.type = "Water";
+				else if (w === "sandstorm") executingMove.type = "Rock";
+				else if (w === "hail" || w === "snow") executingMove.type = "Ice";
+				if (w !== "none") executingMove.power = Math.max(1, Math.floor((move.power ?? 0) * 2));
+			}
+			// Solar Beam: two-turn when not sunny; charge first, fire next turn (skip PP on the firing turn)
+			if (executingMove.id === "solar_beam") {
+				const sunny = (!this.isWeatherSuppressed() && this.state.field.weather.id === "sun");
+				const charging = (user.volatile as any)?.solarBeamCharging === true;
+				if (!sunny && !charging) {
+					user.volatile = user.volatile || {} as any;
+					(user.volatile as any).solarBeamCharging = true;
+					log(`${user.name} absorbed light!`);
+					(this as any)._pushAnim?.({ type: "move:charge", payload: { userId: user.id, moveId: executingMove.id } });
+					return;
+				}
+				if (charging) {
+					(user.volatile as any).solarBeamCharging = false;
+					(user.volatile as any).skipPPThisAction = true;
+				}
+			}
 				// Accuracy check incl. acc/eva stages and No Guard
-				if (move.accuracy != null) {
+				if (executingMove.accuracy != null) {
 					const noGuard = (["no_guard", "noguard"].includes(user.ability ?? "")) || (["no_guard", "noguard"].includes(target.ability ?? ""));
 					if (!noGuard) {
 						const accStage = user.stages.acc ?? 0;
 						const evaStage = target.stages.eva ?? 0;
 						const accMult = stageMultiplier(accStage, 3, 3);
 						const evaMult = stageMultiplier(evaStage, 3, 3);
-						let effectiveAcc = (move.accuracy as number) * (accMult / evaMult);
+						let effectiveAcc = (executingMove.accuracy as number) * (accMult / evaMult);
+						// Weather accuracy mods for Thunder/Hurricane
+						if (!this.isWeatherSuppressed()) {
+							const targetUmbrellaActive = !this.areItemsSuppressed() && ((target.item ?? "").toLowerCase() === "utility_umbrella");
+							const w = this.state.field.weather.id;
+							// If the move targets an Umbrella holder, ignore rain/sun accuracy changes
+							if (!targetUmbrellaActive) {
+								if (w === "rain" && (executingMove.id === "thunder" || executingMove.name.toLowerCase() === "thunder" || executingMove.id === "hurricane" || executingMove.name.toLowerCase() === "hurricane")) {
+									effectiveAcc = 100;
+								}
+								if (w === "sun" && (executingMove.id === "thunder" || executingMove.name.toLowerCase() === "thunder" || executingMove.id === "hurricane" || executingMove.name.toLowerCase() === "hurricane")) {
+									effectiveAcc = Math.floor(effectiveAcc * 0.5);
+								}
+							}
+						}
+						// Snow Cloak evasion under hail/snow (approx -20% hit chance)
+						if (!this.isWeatherSuppressed() && (["hail", "snow"].includes(this.state.field.weather.id))) {
+							if ((target.ability ?? "") === "snow_cloak") {
+								effectiveAcc *= 0.8;
+							}
+						}
+						// Target-held evasion items: Bright Powder / Lax Incense (~10% reduction)
+						{
+							const item = (target.item ?? "").toLowerCase().replace(/[-_\s]/g, "");
+							if (!this.areItemsSuppressed() && (item === "brightpowder" || item === "laxincense")) {
+								effectiveAcc *= 0.9;
+							}
+						}
 						effectiveAcc = this.modifyAccuracy(user, effectiveAcc);
 						effectiveAcc = Math.max(1, Math.min(100, Math.floor(effectiveAcc)));
 						const roll = this.rng() * 100;
@@ -541,21 +680,54 @@ export class Engine implements BattleRuleset {
 				for (let i = 0; i < hits; i++) {
 					if (user.currentHP <= 0 || target.currentHP <= 0) break;
 
-					const atk = this.modifyAttack(user, this.getEffectiveAttack(user, move.category), move.category);
-					const def = this.modifyDefense(target, chooseDefenseStat(target, move.category), move.category);
+					// Absorb/immunity abilities
+					if (move.type === "Water" && target.ability === "water_absorb") {
+						const heal = Math.max(1, Math.floor(target.maxHP / 4));
+						const healed = this.utils(log).heal(target, heal);
+						log(`${target.name} absorbed the water and restored HP! (+${healed})`);
+						(this as any)._pushAnim?.({ type: "ability:water-absorb", payload: { pokemonId: target.id, heal: healed } });
+						return;
+					}
+					if (move.type === "Electric" && target.ability === "volt_absorb") {
+						const heal = Math.max(1, Math.floor(target.maxHP / 4));
+						const healed = this.utils(log).heal(target, heal);
+						log(`${target.name} absorbed the electricity and restored HP! (+${healed})`);
+						(this as any)._pushAnim?.({ type: "ability:volt-absorb", payload: { pokemonId: target.id, heal: healed } });
+						return;
+					}
+					if (move.type === "Fire" && target.ability === "flash_fire") {
+						target.volatile = target.volatile || {} as any;
+						(target.volatile as any).flashFireBoost = true;
+						log(`${target.name}'s Flash Fire boosted its Fire power!`);
+						(this as any)._pushAnim?.({ type: "ability:flash-fire", payload: { pokemonId: target.id } });
+						return;
+					}
+
+					const atk = this.modifyAttack(user, this.getEffectiveAttack(user, executingMove.category), executingMove.category);
+					// Wonder Room: swap the defensive stat used for damage calculation
+					const useWonderSwap = this.state.field.wonderRoom.id === "wonder_room";
+					const baseDefStat = (() => {
+						if (!useWonderSwap) return chooseDefenseStat(target, executingMove.category);
+						// Swap: Physical uses SpD, Special uses Def
+						return executingMove.category === "Physical" ? target.baseStats.spd : target.baseStats.def;
+					})();
+					const usedStatKind: "def" | "spd" = useWonderSwap ? (executingMove.category === "Physical" ? "spd" : "def") : (executingMove.category === "Physical" ? "def" : "spd");
+					(this as any)._usingDefenseStatKind = usedStatKind;
+					const def = this.modifyDefense(target, baseDefStat, executingMove.category);
+					(this as any)._usingDefenseStatKind = undefined;
 					const crit = this.rollCrit(move.critRatio ?? 0);
 					// Ground immunity via Levitate/Magnet Rise/Air Balloon (Flying handled by type chart)
-					if (move.type === "Ground") {
+					if (executingMove.type === "Ground") {
 						const hasLevitate = target.ability === "levitate";
 						const hasMagnetRise = (target.volatile?.magnetRiseTurns ?? 0) > 0;
-						const hasBalloon = ["air_balloon", "airballoon", "air-balloon"].includes((target.item ?? "").toLowerCase());
+						const hasBalloon = !this.areItemsSuppressed() && ["air_balloon", "airballoon", "air-balloon"].includes((target.item ?? "").toLowerCase());
 						if (hasLevitate || hasMagnetRise || hasBalloon) {
 							log(`${target.name} is unaffected by Ground moves!`);
 							effectivenessSeen = 0;
 							continue;
 						}
 					}
-					const { damage, effectiveness, stab } = calcDamage(user, target, move, atk, def, { rng: () => this.rng() });
+					const { damage, effectiveness, stab } = calcDamage(user, target, executingMove, atk, def, { rng: () => this.rng() });
 					effectivenessSeen = effectivenessSeen ?? effectiveness;
 					let finalDamage = damage;
 					if (crit) {
@@ -566,7 +738,9 @@ export class Engine implements BattleRuleset {
 					finalDamage = this.modifyDamage(user, target, finalDamage);
 
 					// Field modifiers: weather/terrain simplified + conditional ability boosts
-					finalDamage = this.applyFieldDamageMods(finalDamage, move, user);
+					(this as any)._currentTarget = target;
+					finalDamage = this.applyFieldDamageMods(finalDamage, executingMove, user);
+					(this as any)._currentTarget = undefined;
 
 					// Side conditions: Reflect/Light Screen on the target's side (ignored on critical hits)
 					const targetOwner = this.state.players.find(pl => pl.team.some(m => m.id === target.id));
@@ -603,8 +777,8 @@ export class Engine implements BattleRuleset {
 						user.volatile = user.volatile || {};
 						(user.volatile as any).dealtDamageThisAction = true;
 					}
-					// Pop Air Balloon if present and took damage
-					if (dealt > 0 && ["air_balloon", "airballoon", "air-balloon"].includes((target.item ?? "").toLowerCase())) {
+					// Pop Air Balloon if present and took damage (but not while items are suppressed by Magic Room)
+					if (dealt > 0 && !this.areItemsSuppressed() && ["air_balloon", "airballoon", "air-balloon"].includes((target.item ?? "").toLowerCase())) {
 						log(`${target.name}'s Air Balloon popped!`);
 						(this as any)._pushAnim?.({ type: "item:air-balloon:pop", payload: { pokemonId: target.id } });
 						target.item = undefined;
@@ -646,6 +820,10 @@ export class Engine implements BattleRuleset {
 
 	private emitSwitchIn(pokemon: Pokemon, log: LogSink = (m) => this.state.log.push(m)) {
 		for (const h of this.switchInHandlers) h(pokemon, this.state, log);
+		// Ability on-switch-in hooks
+		if (pokemon.ability && Abilities[pokemon.ability]?.onSwitchIn) {
+			Abilities[pokemon.ability].onSwitchIn!(pokemon, this.state, log);
+		}
 		// Hazards: Stealth Rock (stored on the side the Pokémon belongs to)
 		const owner = this.state.players.find(p => p.team.some(m => m.id === pokemon.id));
 		// Initialize PP store
@@ -655,9 +833,9 @@ export class Engine implements BattleRuleset {
 		(pokemon.volatile as any).toxicCounter = 0;
 		// Clear substitute on switch-in (cannot persist)
 		if (pokemon.volatile) (pokemon.volatile as any).substituteHP = 0;
-		// Heavy-Duty Boots: ignore all hazard effects (including absorption)
+		// Heavy-Duty Boots: ignore all hazard effects (including absorption) unless Magic Room suppresses items
 		const hasBoots = ["heavy-duty-boots","heavy_duty_boots","heavydutyboots"].includes(pokemon.item ?? "");
-		if (hasBoots) return;
+		if (hasBoots && !this.areItemsSuppressed()) return;
 		if (owner?.sideHazards?.stealthRock) {
 			const mult = typeEffectiveness("Rock", pokemon.types);
 			const frac = (1 / 8) * mult; // simplified scaling by effectiveness
@@ -763,9 +941,11 @@ export class Engine implements BattleRuleset {
 		const base = p.baseStats.spe;
 		let mult = stageMultiplier(p.stages.spe ?? 0);
 		if (p.status === "paralysis") mult *= 0.5; // simplified
-		// Weather speed abilities
-		if (this.state.field.weather.id === "rain" && ["swift_swim","swiftswim"].includes(p.ability ?? "")) mult *= 2;
-		if (this.state.field.weather.id === "sun" && p.ability === "chlorophyll") mult *= 2;
+		// Weather speed abilities (ignored if holder has Utility Umbrella)
+		const hasUmbrella = !this.areItemsSuppressed() && ((p.item ?? "").toLowerCase() === "utility_umbrella");
+		if (!this.isWeatherSuppressed() && !hasUmbrella && this.state.field.weather.id === "rain" && ["swift_swim","swiftswim"].includes(p.ability ?? "")) mult *= 2;
+		if (!this.isWeatherSuppressed() && !hasUmbrella && this.state.field.weather.id === "sun" && p.ability === "chlorophyll") mult *= 2;
+		if (!this.isWeatherSuppressed() && (this.state.field.weather.id === "snow" || this.state.field.weather.id === "hail") && p.ability === "slush_rush") mult *= 2;
 		// Tailwind on owner's side doubles speed
 		const owner = this.state.players.find(pl => pl.team.some(m => m.id === p.id));
 		if (owner?.sideConditions?.tailwindTurns && owner.sideConditions.tailwindTurns > 0) {
@@ -784,7 +964,14 @@ export class Engine implements BattleRuleset {
 		const stage = isPhysical ? (p.stages.atk ?? 0) : (p.stages.spa ?? 0);
 		let mult = stageMultiplier(stage);
 		if (isPhysical && p.status === "burn") mult *= 0.5; // simplified burn halving
-			return Math.floor(base * mult);
+		// Solar Power: boost Special Attack in sun (ignored if holder has Utility Umbrella)
+		if (!isPhysical && !this.isWeatherSuppressed() && this.state.field.weather.id === "sun" && p.ability === "solar_power") {
+			const pUmbrella = !this.areItemsSuppressed() && ((p.item ?? "").toLowerCase() === "utility_umbrella");
+			if (!pUmbrella) {
+			mult *= 1.5;
+			}
+		}
+		return Math.floor(base * mult);
 	}
 
 	private applyFieldDamageMods(damage: number, move: Move, user: Pokemon): number {
@@ -792,17 +979,35 @@ export class Engine implements BattleRuleset {
 		const terrain = this.state.field.terrain.id;
 		let d = damage;
 		// Weather
-		if (weather === "sun") {
-			if (move.type === "Fire") d = Math.floor(d * 1.5);
-			if (move.type === "Water") d = Math.floor(d * 0.5);
+		const userUmbrella = !this.areItemsSuppressed() && ((user.item ?? "").toLowerCase() === "utility_umbrella");
+		const target = (this as any)._currentTarget as Pokemon | undefined;
+		const targetUmbrella = target ? (!this.areItemsSuppressed() && ((target.item ?? "").toLowerCase() === "utility_umbrella")) : false;
+		if (!this.isWeatherSuppressed()) {
+			// Special handling: Hydro Steam is boosted by sun and not reduced by sun; in rain it's still boosted like Water
+			const isHydroSteam = (move.id === "hydro_steam" || move.name.toLowerCase() === "hydro steam");
+			if (weather === "sun") {
+				if (!targetUmbrella) {
+					if (move.type === "Fire") d = Math.floor(d * 1.5);
+					// Sun normally reduces Water; exception for Hydro Steam
+					if (move.type === "Water" && !isHydroSteam) d = Math.floor(d * 0.5);
+				}
+				// Hydro Steam gets a sun boost regardless of target Umbrella (cartridge behavior)
+				if (move.type === "Water" && isHydroSteam) d = Math.floor(d * 1.5);
+			}
+			if (weather === "rain") {
+				if (!targetUmbrella) {
+					if (move.type === "Water") d = Math.floor(d * 1.5);
+					if (move.type === "Fire") d = Math.floor(d * 0.5);
+				}
+			}
+			// Solar Beam: halved power in rain, sandstorm, hail/snow; normal in sun and clear
+			if (move.id === "solar_beam") {
+				if (weather === "rain" || weather === "sandstorm" || weather === "hail" || weather === "snow") {
+					d = Math.floor(d * 0.5);
+				}
+			}
 		}
-		if (weather === "rain") {
-			if (move.type === "Water") d = Math.floor(d * 1.5);
-			if (move.type === "Fire") d = Math.floor(d * 0.5);
-		}
-		if (weather === "snow" || weather === "hail") {
-			if (move.type === "Ice") d = Math.floor(d * 1.5);
-		}
+		// In Gen 9, Snow boosts Defense of Ice-types; no Ice power boost here
 		// Terrain (subset)
 		if (terrain === "grassy") {
 			if (move.type === "Grass") d = Math.floor(d * 1.3);
@@ -813,6 +1018,14 @@ export class Engine implements BattleRuleset {
 			if (user.ability === "torrent" && move.type === "Water") d = Math.floor(d * 1.5);
 			if (user.ability === "overgrow" && move.type === "Grass") d = Math.floor(d * 1.5);
 		}
+		// Flash Fire boost (toggle set when absorbing Fire hit)
+		if (move.type === "Fire" && (user.volatile as any)?.flashFireBoost) {
+			d = Math.floor(d * 1.5);
+		}
+		// Sand Force: boost Rock/Ground/Steel moves in sandstorm
+		if (!this.isWeatherSuppressed() && this.state.field.weather.id === "sandstorm" && user.ability === "sand_force") {
+			if (["Rock","Ground","Steel"].includes(move.type)) d = Math.floor(d * 1.3);
+		}
 		return d;
 	}
 
@@ -821,7 +1034,7 @@ export class Engine implements BattleRuleset {
 		if (target.currentHP <= 1) return damage;
 		// Only from full HP
 		if (target.currentHP === target.maxHP) {
-			if (target.item === "focus_sash") {
+			if (!this.areItemsSuppressed() && target.item === "focus_sash") {
 				const reduced = target.currentHP - 1;
 				log(`${target.name} hung on using its Focus Sash!`);
 				(this as any)._pushAnim?.({ type: "survive:focus-sash", payload: { pokemonId: target.id } });
@@ -859,6 +1072,18 @@ export class Engine implements BattleRuleset {
 				def = Abilities[target.ability].onModifyDef!(target, def, category);
 			if (target.item && Items[target.item]?.onModifyDef)
 				def = Items[target.item].onModifyDef!(target, def, category);
+			// Sandstorm Rock Sp. Def boost and Snow Ice-type Def boost (Umbrella does not affect)
+			// Apply based on the actual defensive stat used (accounts for Wonder Room swaps)
+			const usedKind = (this as any)._usingDefenseStatKind as ("def"|"spd"|undefined);
+			const weatherId = this.state.field.weather.id;
+			if (!this.isWeatherSuppressed() && weatherId === "sandstorm" && target.types.includes("Rock")) {
+				const usingSpD = usedKind ? (usedKind === "spd") : (category === "Special");
+				if (usingSpD) def = Math.floor(def * 1.5);
+			}
+			if (!this.isWeatherSuppressed() && weatherId === "snow" && target.types.includes("Ice")) {
+				const usingDef = usedKind ? (usedKind === "def") : (category === "Physical");
+				if (usingDef) def = Math.floor(def * 1.5);
+			}
 			return def;
 		}
 
