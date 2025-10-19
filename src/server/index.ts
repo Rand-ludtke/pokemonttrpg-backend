@@ -6,6 +6,7 @@ import fs from "fs";
 import { v4 as uuidv4 } from "uuid";
 import Engine from "../engine";
 import { Action, MoveAction, Player, TurnResult } from "../types";
+import { ExternalDexData } from "../adapters/pokedex-adapter";
 import { mergeAbilities } from "../data/abilities";
 import { mergeItems } from "../data/items";
 import { convertShowdownAbilities, convertShowdownItems } from "../data/converters/showdown-converter";
@@ -14,6 +15,7 @@ import { convertShowdownSpecies, convertShowdownMoves } from "../data/converters
 // Simple JSON persistence directories (for Raspberry Pi prototype)
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const REPLAYS_DIR = path.join(DATA_DIR, "replays");
+const CUSTOM_DEX_FILE = path.join(DATA_DIR, "customdex.json");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(REPLAYS_DIR)) fs.mkdirSync(REPLAYS_DIR);
 
@@ -40,6 +42,46 @@ export interface Room {
 const app = express();
 app.use(express.json());
 
+// --- Custom Dex persistence & helpers ---
+function loadCustomDex(): ExternalDexData {
+  try {
+    if (fs.existsSync(CUSTOM_DEX_FILE)) {
+      const json = JSON.parse(fs.readFileSync(CUSTOM_DEX_FILE, "utf-8"));
+      // Ensure shape
+      return { species: json.species ?? {}, moves: json.moves ?? {} } as ExternalDexData;
+    }
+  } catch {}
+  return { species: {}, moves: {} };
+}
+
+function saveCustomDex(dex: ExternalDexData) {
+  const payload = { species: dex.species ?? {}, moves: dex.moves ?? {} };
+  fs.writeFileSync(CUSTOM_DEX_FILE, JSON.stringify(payload, null, 2));
+}
+
+function diffDex(serverDex: ExternalDexData, clientDex: ExternalDexData) {
+  const missingOnClient = { species: {} as Record<string, any>, moves: {} as Record<string, any> };
+  const missingOnServer = { species: {} as Record<string, any>, moves: {} as Record<string, any> };
+
+  // Server -> Client (what client lacks)
+  for (const [id, s] of Object.entries(serverDex.species ?? {})) {
+    if (!clientDex.species || !clientDex.species[id]) missingOnClient.species[id] = s;
+  }
+  for (const [id, m] of Object.entries(serverDex.moves ?? {})) {
+    if (!clientDex.moves || !clientDex.moves[id]) missingOnClient.moves[id] = m;
+  }
+
+  // Client -> Server (what server lacks)
+  for (const [id, s] of Object.entries(clientDex.species ?? {})) {
+    if (!serverDex.species || !serverDex.species[id]) missingOnServer.species[id] = s;
+  }
+  for (const [id, m] of Object.entries(clientDex.moves ?? {})) {
+    if (!serverDex.moves || !serverDex.moves[id]) missingOnServer.moves[id] = m;
+  }
+
+  return { missingOnClient, missingOnServer };
+}
+
 app.get("/api/rooms", (_req: Request, res: Response) => {
   const list = Array.from(rooms.values()).map((r) => ({
     id: r.id,
@@ -49,6 +91,46 @@ app.get("/api/rooms", (_req: Request, res: Response) => {
     started: r.battleStarted,
   }));
   res.json(list);
+});
+
+// Custom Dex APIs
+// 1) Read server-side store
+app.get("/api/customdex", (_req: Request, res: Response) => {
+  const dex = loadCustomDex();
+  res.json(dex);
+});
+
+// 2) Sync: client posts its dex; server returns what client is missing (from server),
+//    and what server is missing (from client). Client may then call /upload to add to server.
+app.post("/api/customdex/sync", (req: Request, res: Response) => {
+  const clientDex = (req.body ?? {}) as ExternalDexData;
+  const serverDex = loadCustomDex();
+  const { missingOnClient, missingOnServer } = diffDex(serverDex, clientDex);
+  res.json({ missingOnClient, missingOnServer });
+});
+
+// 3) Upload: merge new entries from client into server store (no overwrite by default)
+app.post("/api/customdex/upload", (req: Request, res: Response) => {
+  const incoming = (req.body ?? {}) as ExternalDexData;
+  const serverDex = loadCustomDex();
+  let addedSpecies = 0;
+  let addedMoves = 0;
+  serverDex.species = serverDex.species || {};
+  serverDex.moves = serverDex.moves || {};
+  for (const [id, s] of Object.entries(incoming.species ?? {})) {
+    if (!serverDex.species[id]) {
+      serverDex.species[id] = s as any;
+      addedSpecies++;
+    }
+  }
+  for (const [id, m] of Object.entries(incoming.moves ?? {})) {
+    if (!serverDex.moves[id]) {
+      serverDex.moves[id] = m as any;
+      addedMoves++;
+    }
+  }
+  saveCustomDex(serverDex);
+  res.json({ ok: true, added: { species: addedSpecies, moves: addedMoves } });
 });
 
 app.get("/api/rooms/:id", (req: Request, res: Response) => {
