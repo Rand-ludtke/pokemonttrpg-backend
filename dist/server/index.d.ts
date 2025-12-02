@@ -1,5 +1,5 @@
 import Engine from "../engine";
-import { Action } from "../types";
+import { Action, Player } from "../types";
 export interface ClientInfo {
     id: string;
     username: string;
@@ -25,6 +25,27 @@ export interface Room {
     forceSwitchNeeded?: Set<string>;
     forceSwitchTimer?: NodeJS.Timeout;
     forceSwitchDeadline?: number;
+    challenges: Map<string, Challenge>;
+}
+type ChallengeStatus = "pending" | "launching" | "cancelled" | "declined";
+interface ChallengeParticipant {
+    playerId: string;
+    username: string;
+    socketId: string;
+    accepted: boolean;
+    playerPayload?: Player;
+}
+interface Challenge {
+    id: string;
+    roomId: string;
+    createdAt: number;
+    rules?: any;
+    format?: string;
+    status: ChallengeStatus;
+    owner: ChallengeParticipant;
+    target?: ChallengeParticipant;
+    open: boolean;
 }
 export declare function computeNeedsSwitch(state: import("../types").BattleState): string[];
 export declare function startServer(port?: number): void;
+export {};

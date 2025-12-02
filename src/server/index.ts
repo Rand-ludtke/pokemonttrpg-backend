@@ -37,6 +37,108 @@ export interface Room {
   forceSwitchNeeded?: Set<string>;
   forceSwitchTimer?: NodeJS.Timeout;
   forceSwitchDeadline?: number; // epoch ms
+  challenges: Map<string, Challenge>;
+}
+
+type ChallengeStatus = "pending" | "launching" | "cancelled" | "declined";
+
+interface ChallengeParticipant {
+  playerId: string;
+  username: string;
+  socketId: string;
+  accepted: boolean;
+  playerPayload?: Player;
+}
+
+interface Challenge {
+  id: string;
+  roomId: string;
+  createdAt: number;
+  rules?: any;
+  format?: string;
+  status: ChallengeStatus;
+  owner: ChallengeParticipant;
+  target?: ChallengeParticipant;
+  open: boolean;
+}
+
+interface ChallengeSummary {
+  id: string;
+  roomId: string;
+  status: ChallengeStatus;
+  createdAt: number;
+  open: boolean;
+  format?: string;
+  rules?: any;
+  owner: { id: string; username: string; accepted: boolean; ready: boolean };
+  target?: { id: string; username: string; accepted: boolean; ready: boolean } | null;
+}
+
+const DEFAULT_LOBBY_ID = "global-lobby";
+const DEFAULT_LOBBY_NAME = "Global Lobby";
+
+function createRoomRecord(id: string, name: string): Room {
+  return {
+    id,
+    name,
+    players: [],
+    spectators: [],
+    engine: undefined,
+    battleStarted: false,
+    turnBuffer: {},
+    replay: [],
+    phase: "normal",
+    forceSwitchNeeded: new Set(),
+    forceSwitchTimer: undefined,
+    forceSwitchDeadline: undefined,
+    challenges: new Map(),
+  };
+}
+
+function challengeSummary(ch: Challenge): ChallengeSummary {
+  return {
+    id: ch.id,
+    roomId: ch.roomId,
+    status: ch.status,
+    createdAt: ch.createdAt,
+    open: ch.open && !ch.target,
+    format: ch.format,
+    rules: ch.rules,
+    owner: {
+      id: ch.owner.playerId,
+      username: ch.owner.username,
+      accepted: ch.owner.accepted,
+      ready: Boolean(ch.owner.playerPayload),
+    },
+    target: ch.target
+      ? {
+          id: ch.target.playerId,
+          username: ch.target.username,
+          accepted: ch.target.accepted,
+          ready: Boolean(ch.target.playerPayload),
+        }
+      : null,
+  };
+}
+
+function challengeSummaries(room: Room): ChallengeSummary[] {
+  return Array.from(room.challenges.values()).map(challengeSummary);
+}
+
+function findPlayerBySocket(room: Room, socketId: string) {
+  return room.players.find((p) => p.socketId === socketId);
+}
+
+function findSpectatorBySocket(room: Room, socketId: string) {
+  return room.spectators.find((s) => s.socketId === socketId);
+}
+
+function removeClientFromRoom(room: Room, socketId: string) {
+  const playersBefore = room.players.length;
+  room.players = room.players.filter((p) => p.socketId !== socketId);
+  const spectatorsBefore = room.spectators.length;
+  room.spectators = room.spectators.filter((s) => s.socketId !== socketId);
+  return playersBefore !== room.players.length || spectatorsBefore !== room.spectators.length;
 }
 
 const app = express();
@@ -89,6 +191,7 @@ app.get("/api/rooms", (_req: Request, res: Response) => {
     players: r.players.map((p) => p.username),
     spectCount: r.spectators.length,
     started: r.battleStarted,
+    challengeCount: r.challenges.size,
   }));
   res.json(list);
 });
@@ -142,6 +245,7 @@ app.get("/api/rooms/:id", (req: Request, res: Response) => {
     players: room.players.map((p) => ({ id: p.id, username: p.username })),
     spectCount: room.spectators.length,
     started: room.battleStarted,
+    challengeCount: room.challenges.size,
   });
 });
 
@@ -173,6 +277,91 @@ app.get("/api/rooms/:id/snapshot", (req: Request, res: Response) => {
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+function emitChallengeCreated(room: Room, challenge: Challenge) {
+  io.to(room.id).emit("challengeCreated", { roomId: room.id, challenge: challengeSummary(challenge) });
+}
+
+function emitChallengeUpdated(room: Room, challenge: Challenge) {
+  io.to(room.id).emit("challengeUpdated", { roomId: room.id, challenge: challengeSummary(challenge) });
+}
+
+function emitChallengeRemoved(room: Room, challengeId: string, reason: string) {
+  io.to(room.id).emit("challengeRemoved", { roomId: room.id, challengeId, reason });
+}
+
+function sanitizePlayerPayload(player: Player, participant: ChallengeParticipant): Player {
+  const clone = JSON.parse(JSON.stringify(player)) as Player;
+  clone.id = participant.playerId;
+  clone.name = clone.name || participant.username;
+  if (typeof clone.activeIndex !== "number") clone.activeIndex = 0;
+  return clone;
+}
+
+function beginBattle(room: Room, players: Player[], seed?: number) {
+  const battleSeed = seed ?? 123;
+  room.engine = new Engine({ seed: battleSeed });
+  room.turnBuffer = {};
+  room.replay = [];
+  clearForceSwitchTimer(room);
+  const state = room.engine.initializeBattle(players, { seed: battleSeed });
+  room.battleStarted = true;
+  room.phase = "normal";
+  room.forceSwitchNeeded = new Set();
+  io.to(room.id).emit("battleStarted", { state });
+}
+
+function broadcastRoomSummary(room: Room) {
+  io.emit("roomUpdate", summary(room));
+}
+
+function launchChallenge(sourceRoom: Room, challenge: Challenge) {
+  if (!challenge.target) {
+    emitChallengeRemoved(sourceRoom, challenge.id, "no-opponent");
+    sourceRoom.challenges.delete(challenge.id);
+    return;
+  }
+  if (!challenge.owner.playerPayload || !challenge.target.playerPayload) {
+    emitChallengeRemoved(sourceRoom, challenge.id, "missing-team");
+    sourceRoom.challenges.delete(challenge.id);
+    return;
+  }
+
+  const ownerSocket = io.sockets.sockets.get(challenge.owner.socketId);
+  const targetSocket = io.sockets.sockets.get(challenge.target.socketId);
+  if (!ownerSocket || !targetSocket) {
+    emitChallengeRemoved(sourceRoom, challenge.id, "socket-disconnected");
+    sourceRoom.challenges.delete(challenge.id);
+    return;
+  }
+
+  const battleRoomId = uuidv4().slice(0, 8);
+  const nameTokens: string[] = [];
+  if (challenge.format) nameTokens.push(challenge.format);
+  nameTokens.push(`${challenge.owner.username} vs ${challenge.target.username}`);
+  const battleRoomName = `Battle: ${nameTokens.join(" • ")}`;
+  const battleRoom = createRoomRecord(battleRoomId, battleRoomName);
+  rooms.set(battleRoomId, battleRoom);
+
+  ownerSocket.join(battleRoomId);
+  targetSocket.join(battleRoomId);
+
+  battleRoom.players.push({ id: challenge.owner.playerId, username: challenge.owner.username, socketId: challenge.owner.socketId });
+  battleRoom.players.push({ id: challenge.target.playerId, username: challenge.target.username, socketId: challenge.target.socketId });
+
+  const playersPayload = [
+    sanitizePlayerPayload(challenge.owner.playerPayload, challenge.owner),
+    sanitizePlayerPayload(challenge.target.playerPayload, challenge.target),
+  ];
+
+  beginBattle(battleRoom, playersPayload, challenge.rules?.seed);
+
+  sourceRoom.challenges.delete(challenge.id);
+  emitChallengeRemoved(sourceRoom, challenge.id, "launched");
+
+  broadcastRoomSummary(battleRoom);
+  broadcastRoomSummary(sourceRoom);
+}
 // Optionally load external Showdown/Essentials datasets at runtime (not bundled)
 async function tryLoadExternalData() {
   try {
@@ -207,6 +396,7 @@ async function tryLoadExternalData() {
 tryLoadExternalData();
 
 const rooms = new Map<string, Room>();
+rooms.set(DEFAULT_LOBBY_ID, createRoomRecord(DEFAULT_LOBBY_ID, DEFAULT_LOBBY_NAME));
 
 const FORCE_SWITCH_TIMEOUT_MS = Number(process.env.FORCE_SWITCH_TIMEOUT_MS || 45000);
 
@@ -265,21 +455,14 @@ io.on("connection", (socket: Socket) => {
     socket.emit("identified", { id: user.id, username: user.username });
   });
 
-  socket.on("createRoom", (data: { name?: string }) => {
-    const id = uuidv4().slice(0, 8);
-    const room: Room = {
-      id,
-      name: data?.name || `Room ${id}`,
-      players: [],
-      spectators: [],
-      battleStarted: false,
-      turnBuffer: {},
-      replay: [],
-    };
+  socket.on("createRoom", (data: { name?: string; id?: string }) => {
+    const requestedId = data?.id && typeof data.id === "string" ? data.id.trim() : "";
+    const id = requestedId && !rooms.has(requestedId) ? requestedId : uuidv4().slice(0, 8);
+    const room = createRoomRecord(id, data?.name || `Room ${id}`);
     rooms.set(id, room);
     socket.join(id);
     socket.emit("roomCreated", { id, name: room.name });
-    io.to(id).emit("roomUpdate", summary(room));
+    io.emit("roomUpdate", summary(room));
   });
 
   socket.on("joinRoom", (data: { roomId: string; role: "player" | "spectator" }) => {
@@ -296,7 +479,8 @@ io.on("connection", (socket: Socket) => {
   socket.emit("spectate_start", { state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch: Array.from(room.forceSwitchNeeded ?? []), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
       }
     }
-    io.to(room.id).emit("roomUpdate", summary(room));
+    io.emit("roomUpdate", summary(room));
+    socket.emit("challengeSync", { roomId: room.id, challenges: challengeSummaries(room) });
   });
 
   socket.on("startBattle", (data: { roomId: string; players: Player[]; seed?: number }) => {
@@ -377,12 +561,128 @@ io.on("connection", (socket: Socket) => {
     io.to(room.id).emit("chatMessage", { user: user.username, text: data.text, time: Date.now() });
   });
 
+  socket.on("createChallenge", (data: { roomId: string; challengeId?: string; toPlayerId?: string; rules?: any; format?: string; player?: Player }) => {
+    const room = data?.roomId ? rooms.get(data.roomId) : undefined;
+    if (!room) return socket.emit("error", { error: "room not found" });
+    const isPlayer = Boolean(findPlayerBySocket(room, socket.id));
+    if (!isPlayer) return socket.emit("error", { error: "must join as player" });
+
+    const rawId = typeof data?.challengeId === "string" ? data.challengeId.trim() : "";
+    const challengeId = rawId && !room.challenges.has(rawId) ? rawId : uuidv4().slice(0, 8);
+    const targetPlayer = data?.toPlayerId ? room.players.find((p) => p.id === data.toPlayerId) : undefined;
+
+    const challenge: Challenge = {
+      id: challengeId,
+      roomId: room.id,
+      createdAt: Date.now(),
+      rules: data?.rules,
+      format: data?.format,
+      status: "pending",
+      owner: {
+        playerId: user.id,
+        username: user.username,
+        socketId: socket.id,
+        accepted: true,
+        playerPayload: data?.player ? JSON.parse(JSON.stringify(data.player)) : undefined,
+      },
+      target: targetPlayer
+        ? {
+            playerId: targetPlayer.id,
+            username: targetPlayer.username,
+            socketId: targetPlayer.socketId,
+            accepted: false,
+          }
+        : undefined,
+      open: !targetPlayer,
+    };
+
+    room.challenges.set(challenge.id, challenge);
+    emitChallengeCreated(room, challenge);
+    broadcastRoomSummary(room);
+  });
+
+  socket.on("cancelChallenge", (data: { roomId: string; challengeId: string }) => {
+    const room = data?.roomId ? rooms.get(data.roomId) : undefined;
+    if (!room) return;
+    const challenge = data?.challengeId ? room.challenges.get(data.challengeId) : undefined;
+    if (!challenge) return;
+    if (challenge.owner.socketId !== socket.id) return socket.emit("error", { error: "not authorized" });
+    room.challenges.delete(challenge.id);
+    emitChallengeRemoved(room, challenge.id, "cancelled");
+    broadcastRoomSummary(room);
+  });
+
+  socket.on("respondChallenge", (data: { roomId: string; challengeId: string; accepted: boolean; player?: Player }) => {
+    const room = data?.roomId ? rooms.get(data.roomId) : undefined;
+    if (!room) return socket.emit("error", { error: "room not found" });
+    const challenge = data?.challengeId ? room.challenges.get(data.challengeId) : undefined;
+    if (!challenge) return socket.emit("error", { error: "challenge not found" });
+
+    let participant: ChallengeParticipant | undefined;
+    if (challenge.owner.socketId === socket.id) participant = challenge.owner;
+    if (!participant && challenge.target && challenge.target.socketId === socket.id) participant = challenge.target;
+
+    if (!participant && challenge.open && data?.accepted) {
+      // Claim the open challenge
+      challenge.target = {
+        playerId: user.id,
+        username: user.username,
+        socketId: socket.id,
+        accepted: false,
+      };
+      challenge.open = false;
+      participant = challenge.target;
+    }
+
+    if (!participant) return socket.emit("error", { error: "not part of challenge" });
+
+    if (!data?.accepted) {
+      room.challenges.delete(challenge.id);
+      emitChallengeRemoved(room, challenge.id, "declined");
+      broadcastRoomSummary(room);
+      return;
+    }
+
+    if (!data?.player) return socket.emit("error", { error: "team payload required" });
+
+    participant.accepted = true;
+    participant.username = user.username;
+    participant.playerPayload = JSON.parse(JSON.stringify(data.player));
+
+    if (challenge.owner.accepted && challenge.owner.playerPayload && challenge.target && challenge.target.accepted && challenge.target.playerPayload) {
+      challenge.status = "launching";
+      emitChallengeUpdated(room, challenge);
+      launchChallenge(room, challenge);
+    } else {
+      emitChallengeUpdated(room, challenge);
+    }
+  });
+
   socket.on("disconnect", () => {
     // Remove from any rooms
     for (const room of rooms.values()) {
-      room.players = room.players.filter((p) => p.socketId !== socket.id);
-      room.spectators = room.spectators.filter((s) => s.socketId !== socket.id);
-      io.to(room.id).emit("roomUpdate", summary(room));
+      const removed = removeClientFromRoom(room, socket.id);
+      if (removed) {
+        // Clean up challenges involving this socket
+        for (const challenge of Array.from(room.challenges.values())) {
+          if (challenge.owner.socketId === socket.id) {
+            room.challenges.delete(challenge.id);
+            emitChallengeRemoved(room, challenge.id, "creator-left");
+          } else if (challenge.target && challenge.target.socketId === socket.id) {
+            challenge.target = undefined;
+            challenge.open = true;
+            challenge.status = "pending";
+            emitChallengeUpdated(room, challenge);
+          }
+        }
+        broadcastRoomSummary(room);
+      }
+
+      const isEmpty = room.players.length === 0 && room.spectators.length === 0;
+      if (isEmpty && room.id !== DEFAULT_LOBBY_ID) {
+        rooms.delete(room.id);
+        io.emit("roomRemoved", { id: room.id });
+      }
     }
   });
 });
@@ -394,6 +694,7 @@ function summary(room: Room) {
     players: room.players.map((p) => ({ id: p.id, username: p.username })),
     spectCount: room.spectators.length,
     battleStarted: room.battleStarted,
+    challengeCount: room.challenges.size,
   };
 }
 
