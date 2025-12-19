@@ -74,6 +74,7 @@ export type NonVolatileStatusId =
 export interface Pokemon {
 	id: string;
 	name: string;
+	nickname?: string; // optional nickname to display in UI without confusing species name
 	level: number;
 	types: TypeName[];
 	baseStats: Stats;
@@ -90,6 +91,8 @@ export interface Pokemon {
 export interface Player {
 	id: string;
 	name: string;
+	trainerSprite?: string; // optional trainer avatar/sprite identifier or URL
+	background?: string; // optional background/arena identifier or URL
 	team: Pokemon[];
 	activeIndex: number; // index into team
 	// Side conditions (hazards etc.)

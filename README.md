@@ -144,18 +144,34 @@ Note: A direct “sync” endpoint (POST upload) isn’t wired yet. If you need 
 
 ### 2) Internal Player JSON (what `startBattle` expects)
 
-Use this if you convert client-side and send directly to the server:
+Use this if you convert client-side and send directly to the server. Optional cosmetic fields:
+
+- `trainerSprite`: string identifier or URL for the trainer avatar
+- `background`: string identifier or URL for the battle backdrop/arena
+- `pokemon.nickname`: alternate display name shown in the UI (species `name` still powers mechanics)
+
+**Data flow with custom metadata**
+
+1. Client builds a `Player` payload per battler. Any extra fields (e.g., `trainerSprite`, `background`, `themeMusic`, custom flags) can be attached as long as the required engine fields remain intact.
+2. When `createChallenge` or `respondChallenge` runs, the backend clones and stores the entire `Player` object. It only overwrites `id`, `name`, and `activeIndex` for safety; all other properties are preserved.
+3. Once both sides accept, the server launches a new battle room and emits `battleStarted { state }` to **all** sockets in that room (both battlers + spectators). The `state.players` array contains the normalized `Player` objects that include every custom field you attached.
+4. Subsequent `battleUpdate` payloads continue to include those fields in `result.state.players`, so UIs can keep rendering the same metadata without additional messages.
+
+Because of that flow, you can extend the payload whenever you need new cosmetics or per-side session flags without touching the backend—just update your client types to mirror the extra properties.
 
 ```jsonc
 [
 	{
 		"id": "p1",
 		"name": "Player 1",
+		"trainerSprite": "trainer-alice",
+		"background": "arena-forest",
 		"activeIndex": 0,
 		"team": [
 			{
 				"id": "p1-1",
 				"name": "Eevee",
+				"nickname": "Spiffy",
 				"level": 50,
 				"types": ["Normal"],
 				"baseStats": { "hp": 90, "atk": 55, "def": 50, "spa": 45, "spd": 65, "spe": 55 },
@@ -176,11 +192,14 @@ Use this if you convert client-side and send directly to the server:
 	{
 		"id": "p2",
 		"name": "Player 2",
+		"trainerSprite": "trainer-bob",
+		"background": "arena-volcano",
 		"activeIndex": 0,
 		"team": [
 			{
 				"id": "p2-1",
 				"name": "Charmander",
+				"nickname": "Blaze",
 				"level": 50,
 				"types": ["Fire"],
 				"baseStats": { "hp": 88, "atk": 52, "def": 43, "spa": 60, "spd": 50, "spe": 65 },

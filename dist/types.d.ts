@@ -30,6 +30,7 @@ export type NonVolatileStatusId = "burn" | "poison" | "toxic" | "paralysis" | "s
 export interface Pokemon {
     id: string;
     name: string;
+    nickname?: string;
     level: number;
     types: TypeName[];
     baseStats: Stats;
@@ -45,6 +46,8 @@ export interface Pokemon {
 export interface Player {
     id: string;
     name: string;
+    trainerSprite?: string;
+    background?: string;
     team: Pokemon[];
     activeIndex: number;
     sideHazards?: {
