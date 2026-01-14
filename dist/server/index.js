@@ -305,6 +305,8 @@ function startTeamPreview(room, players, rules) {
                     id: `p${i + 1}`,
                     name: player.name || player.id,
                     pokemon: player.team.map((p, idx) => ({
+                        id: p.id,
+                        pokemonId: p.id,
                         ident: `p${i + 1}: ${p.name || p.species}`,
                         details: `${p.species}, L${p.level || 50}`,
                         condition: `${p.currentHP || p.stats?.hp || 100}/${p.stats?.hp || 100}`,
@@ -400,6 +402,8 @@ function emitMovePrompts(room, state) {
             side: player.id,
             playerId: player.id,
             active: [{
+                    id: active.id,
+                    pokemonId: active.id,
                     moves: (active.moves || []).map((move, idx) => ({
                         id: typeof move === 'string' ? move : move.id || move.name || `move${idx}`,
                         name: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
@@ -411,6 +415,8 @@ function emitMovePrompts(room, state) {
                     canSwitch: player.team.filter((p, i) => i !== player.activeIndex && p.currentHP > 0).length > 0,
                 }],
             pokemon: player.team.map((p, idx) => ({
+                id: p.id,
+                pokemonId: p.id,
                 ident: `p${state.players.indexOf(player) + 1}: ${p.name}`,
                 details: `${p.species}, L${p.level}`,
                 condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,

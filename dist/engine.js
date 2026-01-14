@@ -73,8 +73,24 @@ class Engine {
             this.state.log.push(msg);
             events.push(msg);
         };
+        // Debug: log incoming actions and available Pokemon IDs
+        const allPokemonIds = this.state.players.flatMap(pl => pl.team.map(m => m.id));
+        console.log('[Engine] processTurn - incoming actions:', JSON.stringify(actions.map(a => ({ type: a.type, pokemonId: a.pokemonId }))));
+        console.log('[Engine] processTurn - available pokemon IDs:', allPokemonIds);
         // Filter fainted actors and illegal actions
-        const legalActions = actions.filter((a) => this.getPokemonById(a.pokemonId)?.currentHP > 0);
+        const legalActions = actions.filter((a) => {
+            const pokemon = this.getPokemonById(a.pokemonId);
+            if (!pokemon) {
+                console.log(`[Engine] Action rejected: pokemonId "${a.pokemonId}" not found in state`);
+                return false;
+            }
+            if (pokemon.currentHP <= 0) {
+                console.log(`[Engine] Action rejected: pokemonId "${a.pokemonId}" is fainted`);
+                return false;
+            }
+            return true;
+        });
+        console.log('[Engine] processTurn - legal actions after filter:', legalActions.length);
         // Determine coin flip winner once (decides who acts first when priority ties)
         if (!this.state.coinFlipWinner && this.state.players.length >= 2) {
             const idx = this.rng() < 0.5 ? 0 : 1;
