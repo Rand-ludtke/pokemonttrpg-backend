@@ -323,13 +323,19 @@ function startTeamPreview(room: Room, players: Player[], rules?: any) {
   room.teamPreviewOrders = {};
   room.teamPreviewRules = rules;
   
-  // Send team preview request to each player
+  // Emit teamPreviewStarted FIRST so client can mount the battle tab before receiving prompts
+  io.to(room.id).emit("teamPreviewStarted", { roomId: room.id });
+  
+  // Send team preview request to each player (after tab is mounted)
   for (let i = 0; i < players.length; i++) {
     const player = players[i];
     const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
     if (!playerSocket) continue;
     const sock = io.sockets.sockets.get(playerSocket);
     if (!sock) continue;
+    
+    // Find opponent(s) for team preview display
+    const opponents = players.filter((p, idx) => idx !== i);
     
     const maxTeamSize = rules?.maxTeamSize || Math.min(6, player.team.length);
     sock.emit("promptAction", {
@@ -358,10 +364,25 @@ function startTeamPreview(room: Room, players: Player[], rules?: any) {
           })),
         },
       },
+      // Include all players' teams so opponent can be displayed
+      state: {
+        players: players.map((p, pIdx) => ({
+          id: p.id,
+          name: p.name || p.id,
+          activeIndex: 0,
+          team: p.team.map((mon: any) => ({
+            id: mon.id,
+            pokemonId: mon.id,
+            name: mon.name || mon.species,
+            species: mon.species,
+            nickname: mon.nickname,
+            level: mon.level || 50,
+            types: mon.types,
+          })),
+        })),
+      },
     });
   }
-  
-  io.to(room.id).emit("teamPreviewStarted", { roomId: room.id });
 }
 
 function applyTeamOrder(player: Player, order: number[]): Player {
@@ -731,6 +752,9 @@ io.on("connection", (socket: Socket) => {
         room.phase = "normal";
         io.to(room.id).emit("phase", { phase: room.phase });
         clearForceSwitchTimer(room);
+        // Emit new move prompts so players can choose their next action
+        const freshState = (room.engine as any)["state"] as import("../types").BattleState;
+        emitMovePrompts(room, freshState);
       }
       return;
     }

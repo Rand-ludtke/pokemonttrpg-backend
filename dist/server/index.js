@@ -292,6 +292,8 @@ function startTeamPreview(room, players, rules) {
         const sock = io.sockets.sockets.get(playerSocket);
         if (!sock)
             continue;
+        // Find opponent(s) for team preview display
+        const opponents = players.filter((p, idx) => idx !== i);
         const maxTeamSize = rules?.maxTeamSize || Math.min(6, player.team.length);
         sock.emit("promptAction", {
             roomId: room.id,
@@ -318,6 +320,23 @@ function startTeamPreview(room, players, rules) {
                         pokeball: p.pokeball || "pokeball",
                     })),
                 },
+            },
+            // Include all players' teams so opponent can be displayed
+            state: {
+                players: players.map((p, pIdx) => ({
+                    id: p.id,
+                    name: p.name || p.id,
+                    activeIndex: 0,
+                    team: p.team.map((mon) => ({
+                        id: mon.id,
+                        pokemonId: mon.id,
+                        name: mon.name || mon.species,
+                        species: mon.species,
+                        nickname: mon.nickname,
+                        level: mon.level || 50,
+                        types: mon.types,
+                    })),
+                })),
             },
         });
     }
@@ -378,7 +397,8 @@ function beginBattle(room, players, seed, rules) {
     room.battleStarted = true;
     room.phase = "normal";
     room.forceSwitchNeeded = new Set();
-    io.to(room.id).emit("battleStarted", { state });
+    console.log(`[Server] Emitting battleStarted for room ${room.id}`);
+    io.to(room.id).emit("battleStarted", { roomId: room.id, state });
     // Emit move prompts to each player so they can choose their first action
     emitMovePrompts(room, state);
 }
@@ -431,6 +451,7 @@ function emitMovePrompts(room, state) {
             roomId: room.id,
             playerId: player.id,
             prompt: moveRequest,
+            state: state, // Include full battle state so client always has it
         });
     }
 }
@@ -616,7 +637,8 @@ io.on("connection", (socket) => {
         room.battleStarted = true;
         room.phase = "normal";
         room.forceSwitchNeeded = new Set();
-        io.to(room.id).emit("battleStarted", { state });
+        console.log(`[Server] Emitting battleStarted for room ${room.id} (startBattle socket)`);
+        io.to(room.id).emit("battleStarted", { roomId: room.id, state });
     });
     socket.on("sendAction", (data) => {
         const room = rooms.get(data.roomId);
@@ -630,6 +652,7 @@ io.on("connection", (socket) => {
         // Handle team preview phase
         if (room.phase === "team-preview") {
             if (data.action.type === "team" && Array.isArray(data.action.order)) {
+                console.log(`[Server] Team preview order received from ${data.playerId}:`, data.action.order);
                 if (!room.teamPreviewOrders)
                     room.teamPreviewOrders = {};
                 room.teamPreviewOrders[data.playerId] = data.action.order;
@@ -682,16 +705,22 @@ io.on("connection", (socket) => {
                 room.phase = "normal";
                 io.to(room.id).emit("phase", { phase: room.phase });
                 clearForceSwitchTimer(room);
+                // Emit new move prompts so players can choose their next action
+                const freshState = room.engine["state"];
+                emitMovePrompts(room, freshState);
             }
             return;
         }
         room.turnBuffer[data.playerId] = data.action;
+        console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(data.action));
         const expected = room.engine["state"].players.length; // internal access for quick prototype
+        console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
         if (Object.keys(room.turnBuffer).length >= expected) {
             const actions = Object.values(room.turnBuffer);
             room.turnBuffer = {};
             // Filter to only battle actions (move/switch)
             const battleActions = actions.filter((a) => a.type === "move" || a.type === "switch");
+            console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: a.moveId, targetPokemonId: a.targetPokemonId } : {}) }))));
             const result = room.engine.processTurn(battleActions);
             room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
             const needsSwitch = computeNeedsSwitch(result.state);
