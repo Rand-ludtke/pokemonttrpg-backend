@@ -121,17 +121,8 @@ export class Engine implements BattleRuleset {
 		});
 		console.log('[Engine] processTurn - legal actions after filter:', legalActions.length);
 
-		// Determine coin flip winner once (decides who acts first when priority ties)
-		if (!this.state.coinFlipWinner && this.state.players.length >= 2) {
-			const idx = this.rng() < 0.5 ? 0 : 1;
-			const winner = this.state.players[idx];
-			if (winner) {
-				this.state.coinFlipWinner = winner.id;
-				log(`${winner.name} wins the coin flip and will act first this battle.`);
-			}
-		}
-
-		// Sort by priority then speed (reverse speed under Trick Room)
+		// Sort by priority then speed, with random tie-break for true speed ties
+		// (This matches Pokemon Showdown's speedSort behavior)
 		const sorted = [...legalActions].sort((a, b) => this.compareActions(a, b));
 
 		// Execute
@@ -606,20 +597,13 @@ export class Engine implements BattleRuleset {
 		const priorityB = b.type === "switch" ? 6 : this.actionPriority(b);
 		if (priorityA !== priorityB) return priorityB - priorityA; // higher first
 
-		// Coin flip winner acts first (unless both actions belong to same player)
-		const coinWinner = this.state.coinFlipWinner;
-		if (coinWinner) {
-			const aCoin = a.actorPlayerId === coinWinner;
-			const bCoin = b.actorPlayerId === coinWinner;
-			if (aCoin !== bCoin) return aCoin ? -1 : 1;
-		}
-
-		// Speed tiebreaker within same side (still needed for doubles or mirror actions)
+		// Speed comparison (note: actionSpeed accounts for Trick Room)
 		const speA = this.actionSpeed(a);
 		const speB = this.actionSpeed(b);
-		if (speA !== speB) return speB - speA; // higher first (note: actionSpeed accounts for Trick Room)
+		if (speA !== speB) return speB - speA; // higher speed first
 
-		// Random tie-break
+		// TRUE SPEED TIE: same priority AND same speed
+		// Random tie-break each time (matches Pokemon Showdown's behavior)
 		return this.rng() < 0.5 ? -1 : 1;
 	}
 
@@ -846,7 +830,9 @@ export class Engine implements BattleRuleset {
 					log(`It doesn't affect ${target.name}...`);
 					return;
 				}
-				log(`It dealt ${totalDealt} damage${hits > 1 ? ` in ${hits} hits` : ""}.`);
+				// Calculate damage as percentage of max HP
+				const damagePercent = target.maxHP > 0 ? ((totalDealt / target.maxHP) * 100).toFixed(2) : '0.00';
+				log(`It dealt ${damagePercent}% damage${hits > 1 ? ` in ${hits} hits` : ""}.`);
 				if (critHappened) log("A critical hit!");
 				if (effectivenessSeen! > 1) log("It's super effective!");
 				else if (effectivenessSeen! < 1) log("It's not very effective...");
