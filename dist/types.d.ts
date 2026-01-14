@@ -62,23 +62,32 @@ export interface Player {
         lightScreenTurns?: number;
     };
 }
-export type ActionType = "move" | "switch";
+export type ActionType = "move" | "switch" | "team" | "auto";
 export interface ActionBase {
     actorPlayerId: string;
-    pokemonId: string;
     type: ActionType;
 }
 export interface MoveAction extends ActionBase {
     type: "move";
+    pokemonId: string;
     moveId: string;
     targetPlayerId: string;
     targetPokemonId: string;
 }
 export interface SwitchAction extends ActionBase {
     type: "switch";
+    pokemonId: string;
     toIndex: number;
 }
-export type Action = MoveAction | SwitchAction;
+export interface TeamAction extends ActionBase {
+    type: "team";
+    order: number[];
+}
+export interface AutoAction extends ActionBase {
+    type: "auto";
+}
+export type BattleAction = MoveAction | SwitchAction;
+export type Action = MoveAction | SwitchAction | TeamAction | AutoAction;
 export type WeatherId = "none" | "sun" | "rain" | "sandstorm" | "hail" | "snow";
 export type TerrainId = "none" | "electric" | "grassy" | "misty" | "psychic";
 export type RoomId = "none" | "trick_room";
@@ -101,6 +110,7 @@ export interface BattleState {
     players: Player[];
     field: FieldState;
     log: string[];
+    coinFlipWinner?: string;
 }
 export interface TurnResult {
     state: BattleState;

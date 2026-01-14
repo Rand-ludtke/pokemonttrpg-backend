@@ -21,11 +21,14 @@ export interface Room {
     battleStarted: boolean;
     turnBuffer: Record<string, Action>;
     replay: any[];
-    phase?: "normal" | "force-switch";
+    phase?: "normal" | "force-switch" | "team-preview";
     forceSwitchNeeded?: Set<string>;
     forceSwitchTimer?: NodeJS.Timeout;
     forceSwitchDeadline?: number;
     challenges: Map<string, Challenge>;
+    teamPreviewPlayers?: Player[];
+    teamPreviewOrders?: Record<string, number[]>;
+    teamPreviewRules?: any;
 }
 type ChallengeStatus = "pending" | "launching" | "cancelled" | "declined";
 interface ChallengeParticipant {

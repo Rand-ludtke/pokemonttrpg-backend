@@ -110,16 +110,16 @@ export interface Player {
 		};
 }
 
-export type ActionType = "move" | "switch";
+export type ActionType = "move" | "switch" | "team" | "auto";
 
 export interface ActionBase {
 	actorPlayerId: string;
-	pokemonId: string; // acting pokemon
 	type: ActionType;
 }
 
 export interface MoveAction extends ActionBase {
 	type: "move";
+	pokemonId: string; // acting pokemon
 	moveId: string;
 	targetPlayerId: string; // simple single-target for now
 	targetPokemonId: string;
@@ -127,10 +127,24 @@ export interface MoveAction extends ActionBase {
 
 export interface SwitchAction extends ActionBase {
 	type: "switch";
+	pokemonId: string; // acting pokemon
 	toIndex: number; // index on bench
 }
 
-export type Action = MoveAction | SwitchAction;
+export interface TeamAction extends ActionBase {
+	type: "team";
+	order: number[]; // 1-based indices for team order
+}
+
+export interface AutoAction extends ActionBase {
+	type: "auto";
+}
+
+// Actions that can be used in battle (have pokemonId)
+export type BattleAction = MoveAction | SwitchAction;
+
+// All action types
+export type Action = MoveAction | SwitchAction | TeamAction | AutoAction;
 
 export type WeatherId = "none" | "sun" | "rain" | "sandstorm" | "hail" | "snow"; // simplified
 export type TerrainId = "none" | "electric" | "grassy" | "misty" | "psychic";
@@ -157,6 +171,7 @@ export interface BattleState {
 	players: Player[]; // 2 for singles
 	field: FieldState;
 	log: string[]; // basic text log
+	coinFlipWinner?: string; // playerId that moves first (pokemon battle mode)
 }
 
 export interface TurnResult {

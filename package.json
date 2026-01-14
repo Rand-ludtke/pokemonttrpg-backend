@@ -1,6 +1,6 @@
 {
 	"name": "pokemonttrpg-backend",
-	"version": "0.1.0",
+	"version": "1.2.6",
 	"private": true,
 	"description": "Modular, event-driven battle engine for a Pokémon-style TTRPG.",
 	"license": "MIT",

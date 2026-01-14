@@ -33,11 +33,15 @@ export interface Room {
   battleStarted: boolean;
   turnBuffer: Record<string, Action>; // keyed by player id
   replay: any[];
-  phase?: "normal" | "force-switch";
+  phase?: "normal" | "force-switch" | "team-preview";
   forceSwitchNeeded?: Set<string>;
   forceSwitchTimer?: NodeJS.Timeout;
   forceSwitchDeadline?: number; // epoch ms
   challenges: Map<string, Challenge>;
+  // Team preview state
+  teamPreviewPlayers?: Player[];
+  teamPreviewOrders?: Record<string, number[]>;
+  teamPreviewRules?: any;
 }
 
 type ChallengeStatus = "pending" | "launching" | "cancelled" | "declined";
@@ -88,6 +92,9 @@ function createRoomRecord(id: string, name: string): Room {
     turnBuffer: {},
     replay: [],
     phase: "normal",
+    teamPreviewPlayers: undefined,
+    teamPreviewOrders: undefined,
+    teamPreviewRules: undefined,
     forceSwitchNeeded: new Set(),
     forceSwitchTimer: undefined,
     forceSwitchDeadline: undefined,
@@ -142,6 +149,18 @@ function removeClientFromRoom(room: Room, socketId: string) {
 }
 
 const app = express();
+
+// Enable CORS for all API routes
+app.use((_req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (_req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
 // --- Custom Dex persistence & helpers ---
@@ -298,7 +317,101 @@ function sanitizePlayerPayload(player: Player, participant: ChallengeParticipant
   return clone;
 }
 
-function beginBattle(room: Room, players: Player[], seed?: number) {
+function startTeamPreview(room: Room, players: Player[], rules?: any) {
+  room.phase = "team-preview";
+  room.teamPreviewPlayers = players;
+  room.teamPreviewOrders = {};
+  room.teamPreviewRules = rules;
+  
+  // Send team preview request to each player
+  for (let i = 0; i < players.length; i++) {
+    const player = players[i];
+    const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
+    if (!playerSocket) continue;
+    const sock = io.sockets.sockets.get(playerSocket);
+    if (!sock) continue;
+    
+    const maxTeamSize = rules?.maxTeamSize || Math.min(6, player.team.length);
+    sock.emit("promptAction", {
+      roomId: room.id,
+      requestType: "teampreview",
+      playerId: player.id,
+      side: `p${i + 1}`,
+      prompt: {
+        teamPreview: true,
+        maxTeamSize,
+        side: {
+          id: `p${i + 1}`,
+          name: player.name || player.id,
+          pokemon: player.team.map((p: any, idx: number) => ({
+            ident: `p${i + 1}: ${p.name || p.species}`,
+            details: `${p.species}, L${p.level || 50}`,
+            condition: `${p.currentHP || p.stats?.hp || 100}/${p.stats?.hp || 100}`,
+            active: idx === 0,
+            stats: p.stats,
+            moves: p.moves,
+            baseAbility: p.ability,
+            item: p.item,
+            pokeball: p.pokeball || "pokeball",
+          })),
+        },
+      },
+    });
+  }
+  
+  io.to(room.id).emit("teamPreviewStarted", { roomId: room.id });
+}
+
+function applyTeamOrder(player: Player, order: number[]): Player {
+  if (!order || !order.length) return player;
+  const clone = JSON.parse(JSON.stringify(player)) as Player;
+  const newTeam: any[] = [];
+  for (const slot of order) {
+    const idx = slot - 1; // order is 1-based
+    if (idx >= 0 && idx < clone.team.length) {
+      newTeam.push(clone.team[idx]);
+    }
+  }
+  // Add any remaining Pokemon not in the order
+  for (let i = 0; i < clone.team.length; i++) {
+    if (!order.includes(i + 1)) {
+      newTeam.push(clone.team[i]);
+    }
+  }
+  clone.team = newTeam;
+  clone.activeIndex = 0;
+  return clone;
+}
+
+function checkTeamPreviewComplete(room: Room) {
+  if (room.phase !== "team-preview" || !room.teamPreviewPlayers || !room.teamPreviewOrders) return;
+  
+  const allSubmitted = room.teamPreviewPlayers.every(p => room.teamPreviewOrders![p.id]);
+  if (!allSubmitted) return;
+  
+  // Apply team orders and start the battle
+  const orderedPlayers = room.teamPreviewPlayers.map(player => {
+    const order = room.teamPreviewOrders![player.id];
+    return applyTeamOrder(player, order);
+  });
+  
+  // Clear team preview state
+  room.teamPreviewPlayers = undefined;
+  room.teamPreviewOrders = undefined;
+  const rules = room.teamPreviewRules;
+  room.teamPreviewRules = undefined;
+  
+  // Start the actual battle
+  beginBattle(room, orderedPlayers, rules?.seed);
+}
+
+function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) {
+  // Check if team preview is enabled
+  if (rules?.teamPreview && room.phase !== "team-preview") {
+    startTeamPreview(room, players, rules);
+    return;
+  }
+  
   const battleSeed = seed ?? 123;
   room.engine = new Engine({ seed: battleSeed });
   room.turnBuffer = {};
@@ -405,7 +518,7 @@ function launchChallenge(sourceRoom: Room, challenge: Challenge) {
     sanitizePlayerPayload(challenge.target.playerPayload, challenge.target),
   ];
 
-  beginBattle(battleRoom, playersPayload, challenge.rules?.seed);
+  beginBattle(battleRoom, playersPayload, challenge.rules?.seed, challenge.rules);
 
   sourceRoom.challenges.delete(challenge.id);
   emitChallengeRemoved(sourceRoom, challenge.id, "launched");
@@ -548,12 +661,46 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("sendAction", (data: { roomId: string; playerId: string; action: Action }) => {
     const room = rooms.get(data.roomId);
-    if (!room || !room.engine) return socket.emit("error", { error: "room not found or battle not started" });
+    if (!room) return socket.emit("error", { error: "room not found" });
+    
     // Validate sender is a player in the room and matches playerId
     const sender = room.players.find((p) => p.socketId === socket.id);
     if (!sender || sender.id !== data.playerId) {
       return socket.emit("error", { error: "not authorized for this action" });
     }
+    
+    // Handle team preview phase
+    if (room.phase === "team-preview") {
+      if (data.action.type === "team" && Array.isArray((data.action as any).order)) {
+        if (!room.teamPreviewOrders) room.teamPreviewOrders = {};
+        room.teamPreviewOrders[data.playerId] = (data.action as any).order;
+        socket.emit("teamPreviewSubmitted", { playerId: data.playerId });
+        io.to(room.id).emit("teamPreviewProgress", { 
+          playerId: data.playerId, 
+          submitted: Object.keys(room.teamPreviewOrders).length,
+          total: room.teamPreviewPlayers?.length || 2 
+        });
+        checkTeamPreviewComplete(room);
+        return;
+      } else if (data.action.type === "auto") {
+        // Auto-submit with default order
+        if (!room.teamPreviewOrders) room.teamPreviewOrders = {};
+        const playerData = room.teamPreviewPlayers?.find(p => p.id === data.playerId);
+        const defaultOrder = playerData?.team.map((_: any, i: number) => i + 1) || [1, 2, 3, 4, 5, 6];
+        room.teamPreviewOrders[data.playerId] = defaultOrder;
+        socket.emit("teamPreviewSubmitted", { playerId: data.playerId });
+        io.to(room.id).emit("teamPreviewProgress", { 
+          playerId: data.playerId, 
+          submitted: Object.keys(room.teamPreviewOrders).length,
+          total: room.teamPreviewPlayers?.length || 2 
+        });
+        checkTeamPreviewComplete(room);
+        return;
+      }
+      return socket.emit("error", { error: "in team preview phase - must submit team order" });
+    }
+    
+    if (!room.engine) return socket.emit("error", { error: "battle not started" });
     // If we're in force-switch phase, only accept switch actions from required players
     if (room.phase === "force-switch") {
       if (!room.forceSwitchNeeded?.has(data.playerId)) {
@@ -582,7 +729,9 @@ io.on("connection", (socket: Socket) => {
     if (Object.keys(room.turnBuffer).length >= expected) {
       const actions = Object.values(room.turnBuffer);
       room.turnBuffer = {};
-      const result: TurnResult = room.engine.processTurn(actions);
+      // Filter to only battle actions (move/switch)
+      const battleActions = actions.filter((a): a is import("../types").BattleAction => a.type === "move" || a.type === "switch");
+      const result: TurnResult = room.engine.processTurn(battleActions);
       room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
       const needsSwitch: string[] = computeNeedsSwitch(result.state);
       if (needsSwitch.length > 0) {

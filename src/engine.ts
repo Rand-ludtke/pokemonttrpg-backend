@@ -1,5 +1,6 @@
 import {
 	Action,
+	BattleAction,
 	BattleRuleset,
 	BattleState,
 	Category,
@@ -50,6 +51,7 @@ export class Engine implements BattleRuleset {
 				wonderRoom: { id: "none", turnsLeft: 0 },
 			},
 			log: [],
+			coinFlipWinner: undefined,
 		};
 		// Trigger switch-in handlers for initial actives
 		for (const p of this.state.players) {
@@ -83,7 +85,7 @@ export class Engine implements BattleRuleset {
 		return { state: this.state, events, anim };
 	}
 
-	processTurn(actions: Action[]): TurnResult {
+	processTurn(actions: BattleAction[]): TurnResult {
 		if (!this.state) throw new Error("Engine not initialized");
 		this.state.turn += 1;
 		const events: string[] = [];
@@ -97,6 +99,16 @@ export class Engine implements BattleRuleset {
 
 		// Filter fainted actors and illegal actions
 		const legalActions = actions.filter((a) => this.getPokemonById(a.pokemonId)?.currentHP! > 0);
+
+		// Determine coin flip winner once (decides who acts first when priority ties)
+		if (!this.state.coinFlipWinner && this.state.players.length >= 2) {
+			const idx = this.rng() < 0.5 ? 0 : 1;
+			const winner = this.state.players[idx];
+			if (winner) {
+				this.state.coinFlipWinner = winner.id;
+				log(`${winner.name} wins the coin flip and will act first this battle.`);
+			}
+		}
 
 		// Sort by priority then speed (reverse speed under Trick Room)
 		const sorted = [...legalActions].sort((a, b) => this.compareActions(a, b));
@@ -552,13 +564,21 @@ export class Engine implements BattleRuleset {
 		return true;
 	}
 
-	private compareActions(a: Action, b: Action): number {
+	private compareActions(a: BattleAction, b: BattleAction): number {
 		// Switches generally happen before moves in Pokémon; we keep it simple: switch priority = 6
 		const priorityA = a.type === "switch" ? 6 : this.actionPriority(a);
 		const priorityB = b.type === "switch" ? 6 : this.actionPriority(b);
 		if (priorityA !== priorityB) return priorityB - priorityA; // higher first
 
-		// Speed tiebreaker
+		// Coin flip winner acts first (unless both actions belong to same player)
+		const coinWinner = this.state.coinFlipWinner;
+		if (coinWinner) {
+			const aCoin = a.actorPlayerId === coinWinner;
+			const bCoin = b.actorPlayerId === coinWinner;
+			if (aCoin !== bCoin) return aCoin ? -1 : 1;
+		}
+
+		// Speed tiebreaker within same side (still needed for doubles or mirror actions)
 		const speA = this.actionSpeed(a);
 		const speB = this.actionSpeed(b);
 		if (speA !== speB) return speB - speA; // higher first (note: actionSpeed accounts for Trick Room)
@@ -567,7 +587,7 @@ export class Engine implements BattleRuleset {
 		return this.rng() < 0.5 ? -1 : 1;
 	}
 
-	private actionPriority(a: Action): number {
+	private actionPriority(a: BattleAction): number {
 		if (a.type === "move") {
 			const actor = this.getPokemonById(a.pokemonId);
 			const move = actor?.moves.find((m) => m.id === a.moveId);
@@ -576,7 +596,7 @@ export class Engine implements BattleRuleset {
 		return 0;
 	}
 
-	private actionSpeed(a: Action): number {
+	private actionSpeed(a: BattleAction): number {
 		const actor = this.getPokemonById(a.pokemonId);
 		if (!actor) return 0;
 		const base = this.getEffectiveSpeed(actor);

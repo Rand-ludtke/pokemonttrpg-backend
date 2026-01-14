@@ -27,6 +27,7 @@ class Engine {
                 wonderRoom: { id: "none", turnsLeft: 0 },
             },
             log: [],
+            coinFlipWinner: undefined,
         };
         // Trigger switch-in handlers for initial actives
         for (const p of this.state.players) {
@@ -74,6 +75,15 @@ class Engine {
         };
         // Filter fainted actors and illegal actions
         const legalActions = actions.filter((a) => this.getPokemonById(a.pokemonId)?.currentHP > 0);
+        // Determine coin flip winner once (decides who acts first when priority ties)
+        if (!this.state.coinFlipWinner && this.state.players.length >= 2) {
+            const idx = this.rng() < 0.5 ? 0 : 1;
+            const winner = this.state.players[idx];
+            if (winner) {
+                this.state.coinFlipWinner = winner.id;
+                log(`${winner.name} wins the coin flip and will act first this battle.`);
+            }
+        }
         // Sort by priority then speed (reverse speed under Trick Room)
         const sorted = [...legalActions].sort((a, b) => this.compareActions(a, b));
         // Execute
@@ -561,7 +571,15 @@ class Engine {
         const priorityB = b.type === "switch" ? 6 : this.actionPriority(b);
         if (priorityA !== priorityB)
             return priorityB - priorityA; // higher first
-        // Speed tiebreaker
+        // Coin flip winner acts first (unless both actions belong to same player)
+        const coinWinner = this.state.coinFlipWinner;
+        if (coinWinner) {
+            const aCoin = a.actorPlayerId === coinWinner;
+            const bCoin = b.actorPlayerId === coinWinner;
+            if (aCoin !== bCoin)
+                return aCoin ? -1 : 1;
+        }
+        // Speed tiebreaker within same side (still needed for doubles or mirror actions)
         const speA = this.actionSpeed(a);
         const speB = this.actionSpeed(b);
         if (speA !== speB)

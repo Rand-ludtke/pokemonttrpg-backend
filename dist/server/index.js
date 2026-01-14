@@ -70,6 +70,9 @@ function createRoomRecord(id, name) {
         turnBuffer: {},
         replay: [],
         phase: "normal",
+        teamPreviewPlayers: undefined,
+        teamPreviewOrders: undefined,
+        teamPreviewRules: undefined,
         forceSwitchNeeded: new Set(),
         forceSwitchTimer: undefined,
         forceSwitchDeadline: undefined,
@@ -118,6 +121,16 @@ function removeClientFromRoom(room, socketId) {
     return playersBefore !== room.players.length || spectatorsBefore !== room.spectators.length;
 }
 const app = (0, express_1.default)();
+// Enable CORS for all API routes
+app.use((_req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (_req.method === "OPTIONS") {
+        return res.sendStatus(200);
+    }
+    next();
+});
 app.use(express_1.default.json());
 // --- Custom Dex persistence & helpers ---
 function loadCustomDex() {
@@ -265,7 +278,95 @@ function sanitizePlayerPayload(player, participant) {
         clone.activeIndex = 0;
     return clone;
 }
-function beginBattle(room, players, seed) {
+function startTeamPreview(room, players, rules) {
+    room.phase = "team-preview";
+    room.teamPreviewPlayers = players;
+    room.teamPreviewOrders = {};
+    room.teamPreviewRules = rules;
+    // Send team preview request to each player
+    for (let i = 0; i < players.length; i++) {
+        const player = players[i];
+        const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
+        if (!playerSocket)
+            continue;
+        const sock = io.sockets.sockets.get(playerSocket);
+        if (!sock)
+            continue;
+        const maxTeamSize = rules?.maxTeamSize || Math.min(6, player.team.length);
+        sock.emit("promptAction", {
+            roomId: room.id,
+            requestType: "teampreview",
+            playerId: player.id,
+            side: `p${i + 1}`,
+            prompt: {
+                teamPreview: true,
+                maxTeamSize,
+                side: {
+                    id: `p${i + 1}`,
+                    name: player.name || player.id,
+                    pokemon: player.team.map((p, idx) => ({
+                        ident: `p${i + 1}: ${p.name || p.species}`,
+                        details: `${p.species}, L${p.level || 50}`,
+                        condition: `${p.currentHP || p.stats?.hp || 100}/${p.stats?.hp || 100}`,
+                        active: idx === 0,
+                        stats: p.stats,
+                        moves: p.moves,
+                        baseAbility: p.ability,
+                        item: p.item,
+                        pokeball: p.pokeball || "pokeball",
+                    })),
+                },
+            },
+        });
+    }
+    io.to(room.id).emit("teamPreviewStarted", { roomId: room.id });
+}
+function applyTeamOrder(player, order) {
+    if (!order || !order.length)
+        return player;
+    const clone = JSON.parse(JSON.stringify(player));
+    const newTeam = [];
+    for (const slot of order) {
+        const idx = slot - 1; // order is 1-based
+        if (idx >= 0 && idx < clone.team.length) {
+            newTeam.push(clone.team[idx]);
+        }
+    }
+    // Add any remaining Pokemon not in the order
+    for (let i = 0; i < clone.team.length; i++) {
+        if (!order.includes(i + 1)) {
+            newTeam.push(clone.team[i]);
+        }
+    }
+    clone.team = newTeam;
+    clone.activeIndex = 0;
+    return clone;
+}
+function checkTeamPreviewComplete(room) {
+    if (room.phase !== "team-preview" || !room.teamPreviewPlayers || !room.teamPreviewOrders)
+        return;
+    const allSubmitted = room.teamPreviewPlayers.every(p => room.teamPreviewOrders[p.id]);
+    if (!allSubmitted)
+        return;
+    // Apply team orders and start the battle
+    const orderedPlayers = room.teamPreviewPlayers.map(player => {
+        const order = room.teamPreviewOrders[player.id];
+        return applyTeamOrder(player, order);
+    });
+    // Clear team preview state
+    room.teamPreviewPlayers = undefined;
+    room.teamPreviewOrders = undefined;
+    const rules = room.teamPreviewRules;
+    room.teamPreviewRules = undefined;
+    // Start the actual battle
+    beginBattle(room, orderedPlayers, rules?.seed);
+}
+function beginBattle(room, players, seed, rules) {
+    // Check if team preview is enabled
+    if (rules?.teamPreview && room.phase !== "team-preview") {
+        startTeamPreview(room, players, rules);
+        return;
+    }
     const battleSeed = seed ?? 123;
     room.engine = new engine_1.default({ seed: battleSeed });
     room.turnBuffer = {};
@@ -276,6 +377,56 @@ function beginBattle(room, players, seed) {
     room.phase = "normal";
     room.forceSwitchNeeded = new Set();
     io.to(room.id).emit("battleStarted", { state });
+    // Emit move prompts to each player so they can choose their first action
+    emitMovePrompts(room, state);
+}
+// Emit move prompts to all players in a battle
+function emitMovePrompts(room, state) {
+    if (!room.engine)
+        return;
+    for (const player of state.players) {
+        const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
+        if (!playerSocket)
+            continue;
+        const sock = io.sockets.sockets.get(playerSocket);
+        if (!sock)
+            continue;
+        const active = player.team[player.activeIndex];
+        if (!active || active.currentHP <= 0)
+            continue;
+        // Build the move request similar to PS format
+        const moveRequest = {
+            requestType: 'move',
+            side: player.id,
+            playerId: player.id,
+            active: [{
+                    moves: (active.moves || []).map((move, idx) => ({
+                        id: typeof move === 'string' ? move : move.id || move.name || `move${idx}`,
+                        name: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
+                        pp: (active.volatile?.pp?.[typeof move === 'string' ? move : move.id] ?? move.pp ?? 10),
+                        maxpp: move.maxpp ?? move.pp ?? 10,
+                        target: move.target || 'normal',
+                        disabled: move.disabled || false,
+                    })),
+                    canSwitch: player.team.filter((p, i) => i !== player.activeIndex && p.currentHP > 0).length > 0,
+                }],
+            pokemon: player.team.map((p, idx) => ({
+                ident: `p${state.players.indexOf(player) + 1}: ${p.name}`,
+                details: `${p.species}, L${p.level}`,
+                condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+                active: idx === player.activeIndex,
+                stats: p.stats,
+                moves: p.moves,
+                item: p.item,
+                ability: p.ability,
+            })),
+        };
+        sock.emit("promptAction", {
+            roomId: room.id,
+            playerId: player.id,
+            prompt: moveRequest,
+        });
+    }
 }
 function broadcastRoomSummary(room) {
     io.emit("roomUpdate", summary(room));
@@ -314,7 +465,7 @@ function launchChallenge(sourceRoom, challenge) {
         sanitizePlayerPayload(challenge.owner.playerPayload, challenge.owner),
         sanitizePlayerPayload(challenge.target.playerPayload, challenge.target),
     ];
-    beginBattle(battleRoom, playersPayload, challenge.rules?.seed);
+    beginBattle(battleRoom, playersPayload, challenge.rules?.seed, challenge.rules);
     sourceRoom.challenges.delete(challenge.id);
     emitChallengeRemoved(sourceRoom, challenge.id, "launched");
     broadcastRoomSummary(battleRoom);
@@ -463,13 +614,48 @@ io.on("connection", (socket) => {
     });
     socket.on("sendAction", (data) => {
         const room = rooms.get(data.roomId);
-        if (!room || !room.engine)
-            return socket.emit("error", { error: "room not found or battle not started" });
+        if (!room)
+            return socket.emit("error", { error: "room not found" });
         // Validate sender is a player in the room and matches playerId
         const sender = room.players.find((p) => p.socketId === socket.id);
         if (!sender || sender.id !== data.playerId) {
             return socket.emit("error", { error: "not authorized for this action" });
         }
+        // Handle team preview phase
+        if (room.phase === "team-preview") {
+            if (data.action.type === "team" && Array.isArray(data.action.order)) {
+                if (!room.teamPreviewOrders)
+                    room.teamPreviewOrders = {};
+                room.teamPreviewOrders[data.playerId] = data.action.order;
+                socket.emit("teamPreviewSubmitted", { playerId: data.playerId });
+                io.to(room.id).emit("teamPreviewProgress", {
+                    playerId: data.playerId,
+                    submitted: Object.keys(room.teamPreviewOrders).length,
+                    total: room.teamPreviewPlayers?.length || 2
+                });
+                checkTeamPreviewComplete(room);
+                return;
+            }
+            else if (data.action.type === "auto") {
+                // Auto-submit with default order
+                if (!room.teamPreviewOrders)
+                    room.teamPreviewOrders = {};
+                const playerData = room.teamPreviewPlayers?.find(p => p.id === data.playerId);
+                const defaultOrder = playerData?.team.map((_, i) => i + 1) || [1, 2, 3, 4, 5, 6];
+                room.teamPreviewOrders[data.playerId] = defaultOrder;
+                socket.emit("teamPreviewSubmitted", { playerId: data.playerId });
+                io.to(room.id).emit("teamPreviewProgress", {
+                    playerId: data.playerId,
+                    submitted: Object.keys(room.teamPreviewOrders).length,
+                    total: room.teamPreviewPlayers?.length || 2
+                });
+                checkTeamPreviewComplete(room);
+                return;
+            }
+            return socket.emit("error", { error: "in team preview phase - must submit team order" });
+        }
+        if (!room.engine)
+            return socket.emit("error", { error: "battle not started" });
         // If we're in force-switch phase, only accept switch actions from required players
         if (room.phase === "force-switch") {
             if (!room.forceSwitchNeeded?.has(data.playerId)) {
@@ -498,7 +684,9 @@ io.on("connection", (socket) => {
         if (Object.keys(room.turnBuffer).length >= expected) {
             const actions = Object.values(room.turnBuffer);
             room.turnBuffer = {};
-            const result = room.engine.processTurn(actions);
+            // Filter to only battle actions (move/switch)
+            const battleActions = actions.filter((a) => a.type === "move" || a.type === "switch");
+            const result = room.engine.processTurn(battleActions);
             room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
             const needsSwitch = computeNeedsSwitch(result.state);
             if (needsSwitch.length > 0) {
@@ -516,9 +704,13 @@ io.on("connection", (socket) => {
                 io.to(room.id).emit("battleEnd", { winner, replayId });
                 clearForceSwitchTimer(room);
             }
+            else if (needsSwitch.length === 0) {
+                // Emit new move prompts for the next turn
+                emitMovePrompts(room, result.state);
+            }
         }
         else {
-            // prompt others
+            // prompt others that we're waiting
             io.to(room.id).emit("promptAction", { waitingFor: expected - Object.keys(room.turnBuffer).length });
         }
     });

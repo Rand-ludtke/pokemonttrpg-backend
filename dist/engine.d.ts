@@ -1,4 +1,4 @@
-import { Action, BattleRuleset, BattleState, AnimationEvent, LogSink, Move, Pokemon, TurnResult, NonVolatileStatusId, Player } from "./types";
+import { BattleAction, BattleRuleset, BattleState, AnimationEvent, LogSink, Move, Pokemon, TurnResult, NonVolatileStatusId, Player } from "./types";
 type Handler<T extends any[]> = (...args: T) => void;
 export declare class Engine implements BattleRuleset {
     private readonly options?;
@@ -18,7 +18,7 @@ export declare class Engine implements BattleRuleset {
         events: string[];
         anim: AnimationEvent[];
     };
-    processTurn(actions: Action[]): TurnResult;
+    processTurn(actions: BattleAction[]): TurnResult;
     onMoveExecute(handler: Handler<[Move, Pokemon, Pokemon, BattleState, LogSink]>): void;
     onStatusTick(handler: Handler<[Pokemon, NonVolatileStatusId, BattleState, LogSink]>): void;
     onSwitchIn(handler: Handler<[Pokemon, BattleState, LogSink]>): void;
