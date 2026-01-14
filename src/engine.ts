@@ -99,7 +99,11 @@ export class Engine implements BattleRuleset {
 
 		// Debug: log incoming actions and available Pokemon IDs
 		const allPokemonIds = this.state.players.flatMap(pl => pl.team.map(m => m.id));
-		console.log('[Engine] processTurn - incoming actions:', JSON.stringify(actions.map(a => ({ type: a.type, pokemonId: a.pokemonId }))));
+		console.log('[Engine] processTurn - incoming actions:', JSON.stringify(actions.map(a => ({ 
+			type: a.type, 
+			pokemonId: a.pokemonId,
+			...(a.type === 'move' ? { moveId: (a as any).moveId, targetPokemonId: (a as any).targetPokemonId } : {})
+		}))));
 		console.log('[Engine] processTurn - available pokemon IDs:', allPokemonIds);
 
 		// Filter fainted actors and illegal actions
@@ -176,8 +180,23 @@ export class Engine implements BattleRuleset {
 				}
 				let requested = actor.moves.find((m) => m.id === ma.moveId);
 				let move = requested;
-				const target = this.getPokemonById(ma.targetPokemonId);
-				if (!target) continue;
+				let target = this.getPokemonById(ma.targetPokemonId);
+				// Fallback: if target not found by ID, try to find opponent's active Pokemon
+				if (!target) {
+					console.log(`[Engine] Target "${ma.targetPokemonId}" not found, attempting fallback...`);
+					// Find the player this actor belongs to
+					const actorPlayer = this.state.players.find(pl => pl.team.some(m => m.id === action.pokemonId));
+					// Find opponent player
+					const opponentPlayer = this.state.players.find(pl => pl !== actorPlayer);
+					if (opponentPlayer) {
+						target = opponentPlayer.team[opponentPlayer.activeIndex];
+						console.log(`[Engine] Fallback target: ${target?.id} (${target?.name})`);
+					}
+				}
+				if (!target) {
+					console.log(`[Engine] Move skipped: no valid target for "${ma.moveId}" (targetPokemonId: "${ma.targetPokemonId}")`);
+					continue;
+				}
 				actor.volatile = actor.volatile || {};
 				(actor.volatile as any).pp = (actor.volatile as any).pp || {};
 				const ppStore = (actor.volatile as any).pp as Record<string, number>;

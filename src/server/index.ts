@@ -423,7 +423,8 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   room.battleStarted = true;
   room.phase = "normal";
   room.forceSwitchNeeded = new Set();
-  io.to(room.id).emit("battleStarted", { state });
+  console.log(`[Server] Emitting battleStarted for room ${room.id}`);
+  io.to(room.id).emit("battleStarted", { roomId: room.id, state });
   
   // Emit move prompts to each player so they can choose their first action
   emitMovePrompts(room, state);
@@ -477,6 +478,7 @@ function emitMovePrompts(room: Room, state: BattleState) {
       roomId: room.id,
       playerId: player.id,
       prompt: moveRequest,
+      state: state, // Include full battle state so client always has it
     });
   }
 }
@@ -662,7 +664,8 @@ io.on("connection", (socket: Socket) => {
     room.battleStarted = true;
     room.phase = "normal";
     room.forceSwitchNeeded = new Set();
-    io.to(room.id).emit("battleStarted", { state });
+    console.log(`[Server] Emitting battleStarted for room ${room.id} (startBattle socket)`);
+    io.to(room.id).emit("battleStarted", { roomId: room.id, state });
   });
 
   socket.on("sendAction", (data: { roomId: string; playerId: string; action: Action }) => {
@@ -678,6 +681,7 @@ io.on("connection", (socket: Socket) => {
     // Handle team preview phase
     if (room.phase === "team-preview") {
       if (data.action.type === "team" && Array.isArray((data.action as any).order)) {
+        console.log(`[Server] Team preview order received from ${data.playerId}:`, (data.action as any).order);
         if (!room.teamPreviewOrders) room.teamPreviewOrders = {};
         room.teamPreviewOrders[data.playerId] = (data.action as any).order;
         socket.emit("teamPreviewSubmitted", { playerId: data.playerId });
@@ -731,12 +735,15 @@ io.on("connection", (socket: Socket) => {
       return;
     }
     room.turnBuffer[data.playerId] = data.action;
+    console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(data.action));
     const expected = room.engine["state"].players.length; // internal access for quick prototype
+    console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
     if (Object.keys(room.turnBuffer).length >= expected) {
       const actions = Object.values(room.turnBuffer);
       room.turnBuffer = {};
       // Filter to only battle actions (move/switch)
       const battleActions = actions.filter((a): a is import("../types").BattleAction => a.type === "move" || a.type === "switch");
+      console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: (a as any).moveId, targetPokemonId: (a as any).targetPokemonId } : {}) }))));
       const result: TurnResult = room.engine.processTurn(battleActions);
       room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
       const needsSwitch: string[] = computeNeedsSwitch(result.state);
