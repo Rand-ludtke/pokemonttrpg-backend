@@ -504,6 +504,49 @@ function emitMovePrompts(room: Room, state: BattleState) {
   }
 }
 
+// Emit force-switch prompts to players who need to switch due to fainted Pokemon
+function emitForceSwitchPrompts(room: Room, state: BattleState, needsSwitch: string[]) {
+  for (const playerId of needsSwitch) {
+    const playerSocket = room.players.find(p => p.id === playerId)?.socketId;
+    if (!playerSocket) continue;
+    const sock = io.sockets.sockets.get(playerSocket);
+    if (!sock) continue;
+    
+    const player = state.players.find(p => p.id === playerId);
+    if (!player) continue;
+    
+    const sideIndex = state.players.indexOf(player);
+    
+    const switchRequest = {
+      forceSwitch: [true], // Single slot
+      side: {
+        id: `p${sideIndex + 1}`,
+        name: player.name,
+        pokemon: player.team.map((p: any, idx: number) => ({
+          id: p.id,
+          pokemonId: p.id,
+          ident: `p${sideIndex + 1}: ${p.name}`,
+          details: `${p.species}, L${p.level}`,
+          condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+          active: idx === player.activeIndex,
+          stats: p.stats,
+          moves: p.moves,
+          item: p.item,
+          ability: p.ability,
+          fainted: p.currentHP <= 0,
+        })),
+      },
+    };
+    
+    sock.emit("promptAction", {
+      roomId: room.id,
+      playerId: player.id,
+      prompt: switchRequest,
+      state: state,
+    });
+  }
+}
+
 function broadcastRoomSummary(room: Room) {
   io.emit("roomUpdate", summary(room));
 }
@@ -626,6 +669,9 @@ function startForceSwitchTimer(room: Room) {
       room.phase = "normal";
       io.to(room.id).emit("phase", { phase: room.phase });
       clearForceSwitchTimer(room);
+      // Emit new move prompts so players can choose their next action
+      const freshState = (room.engine as any)["state"] as import("../types").BattleState;
+      emitMovePrompts(room, freshState);
     } else {
       // Extend time for any still-required (optional). For simplicity, clear deadline and keep old until manual switches.
     }
@@ -776,6 +822,8 @@ io.on("connection", (socket: Socket) => {
         room.forceSwitchNeeded = new Set(needsSwitch);
         io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
         startForceSwitchTimer(room);
+        // Emit force-switch prompts to players who need to switch
+        emitForceSwitchPrompts(room, result.state, needsSwitch);
       }
       io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
       // Simple end detection: if any player's active mon is fainted and no healthy mons remain
