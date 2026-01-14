@@ -5,7 +5,7 @@ import path from "path";
 import fs from "fs";
 import { v4 as uuidv4 } from "uuid";
 import Engine from "../engine";
-import { Action, MoveAction, Player, TurnResult } from "../types";
+import { Action, MoveAction, Player, TurnResult, BattleState } from "../types";
 import { ExternalDexData } from "../adapters/pokedex-adapter";
 import { mergeAbilities } from "../data/abilities";
 import { mergeItems } from "../data/items";
@@ -309,6 +309,57 @@ function beginBattle(room: Room, players: Player[], seed?: number) {
   room.phase = "normal";
   room.forceSwitchNeeded = new Set();
   io.to(room.id).emit("battleStarted", { state });
+  
+  // Emit move prompts to each player so they can choose their first action
+  emitMovePrompts(room, state);
+}
+
+// Emit move prompts to all players in a battle
+function emitMovePrompts(room: Room, state: BattleState) {
+  if (!room.engine) return;
+  for (const player of state.players) {
+    const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
+    if (!playerSocket) continue;
+    const sock = io.sockets.sockets.get(playerSocket);
+    if (!sock) continue;
+    
+    const active = player.team[player.activeIndex];
+    if (!active || active.currentHP <= 0) continue;
+    
+    // Build the move request similar to PS format
+    const moveRequest = {
+      requestType: 'move' as const,
+      side: player.id,
+      playerId: player.id,
+      active: [{
+        moves: (active.moves || []).map((move: any, idx: number) => ({
+          id: typeof move === 'string' ? move : move.id || move.name || `move${idx}`,
+          name: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
+          pp: ((active as any).volatile?.pp?.[typeof move === 'string' ? move : move.id] ?? move.pp ?? 10),
+          maxpp: move.maxpp ?? move.pp ?? 10,
+          target: move.target || 'normal',
+          disabled: move.disabled || false,
+        })),
+        canSwitch: player.team.filter((p: any, i: number) => i !== player.activeIndex && p.currentHP > 0).length > 0,
+      }],
+      pokemon: player.team.map((p: any, idx: number) => ({
+        ident: `p${state.players.indexOf(player) + 1}: ${p.name}`,
+        details: `${p.species}, L${p.level}`,
+        condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+        active: idx === player.activeIndex,
+        stats: p.stats,
+        moves: p.moves,
+        item: p.item,
+        ability: p.ability,
+      })),
+    };
+    
+    sock.emit("promptAction", {
+      roomId: room.id,
+      playerId: player.id,
+      prompt: moveRequest,
+    });
+  }
 }
 
 function broadcastRoomSummary(room: Room) {
@@ -540,7 +591,7 @@ io.on("connection", (socket: Socket) => {
         io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
         startForceSwitchTimer(room);
       }
-  io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
+      io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
       // Simple end detection: if any player's active mon is fainted and no healthy mons remain
       const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));
       if (sideDefeated) {
@@ -548,9 +599,12 @@ io.on("connection", (socket: Socket) => {
         const replayId = saveReplay(room);
         io.to(room.id).emit("battleEnd", { winner, replayId });
         clearForceSwitchTimer(room);
+      } else if (needsSwitch.length === 0) {
+        // Emit new move prompts for the next turn
+        emitMovePrompts(room, result.state);
       }
     } else {
-      // prompt others
+      // prompt others that we're waiting
       io.to(room.id).emit("promptAction", { waitingFor: expected - Object.keys(room.turnBuffer).length });
     }
   });
