@@ -414,9 +414,14 @@ function applyTeamOrder(player: Player, order: number[]): Player {
 }
 
 function checkTeamPreviewComplete(room: Room) {
+  console.log(`[checkTeamPreviewComplete] phase=${room.phase}, hasPlayers=${!!room.teamPreviewPlayers}, hasOrders=${!!room.teamPreviewOrders}`);
   if (room.phase !== "team-preview" || !room.teamPreviewPlayers || !room.teamPreviewOrders) return;
   
+  console.log(`[checkTeamPreviewComplete] Players:`, room.teamPreviewPlayers.map(p => p.id));
+  console.log(`[checkTeamPreviewComplete] Orders submitted:`, Object.keys(room.teamPreviewOrders));
+  
   const allSubmitted = room.teamPreviewPlayers.every(p => room.teamPreviewOrders![p.id]);
+  console.log(`[checkTeamPreviewComplete] allSubmitted=${allSubmitted}`);
   if (!allSubmitted) return;
   
   // Apply team orders and start the battle
