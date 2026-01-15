@@ -786,6 +786,18 @@ io.on("connection", (socket: Socket) => {
       if (data.action.type !== "switch") {
         return socket.emit("error", { error: "must switch due to faint" });
       }
+      // Validate switch target is not fainted
+      const forceSwitchState = (room.engine as any)["state"] as import("../types").BattleState;
+      const forceSwitchPlayer = forceSwitchState.players.find(p => p.id === data.playerId);
+      if (forceSwitchPlayer) {
+        const targetMon = forceSwitchPlayer.team[(data.action as any).toIndex];
+        if (!targetMon || targetMon.currentHP <= 0) {
+          return socket.emit("error", { error: "cannot switch to a fainted Pokemon" });
+        }
+        if ((data.action as any).toIndex === forceSwitchPlayer.activeIndex) {
+          return socket.emit("error", { error: "cannot switch to the same Pokemon" });
+        }
+      }
       // Perform immediate forced switch via engine
       const res = room.engine.forceSwitch(data.playerId, (data.action as any).toIndex);
       room.replay.push({ turn: res.state.turn, events: res.events, anim: res.anim, phase: "force-switch" });
@@ -803,6 +815,20 @@ io.on("connection", (socket: Socket) => {
         emitMovePrompts(room, freshState);
       }
       return;
+    }
+    // Validate switch actions before buffering
+    if (data.action.type === "switch") {
+      const normalState = (room.engine as any)["state"] as import("../types").BattleState;
+      const normalPlayer = normalState.players.find(p => p.id === data.playerId);
+      if (normalPlayer) {
+        const targetMon = normalPlayer.team[(data.action as any).toIndex];
+        if (!targetMon || targetMon.currentHP <= 0) {
+          return socket.emit("error", { error: "cannot switch to a fainted Pokemon" });
+        }
+        if ((data.action as any).toIndex === normalPlayer.activeIndex) {
+          return socket.emit("error", { error: "cannot switch to the same Pokemon" });
+        }
+      }
     }
     room.turnBuffer[data.playerId] = data.action;
     console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(data.action));
