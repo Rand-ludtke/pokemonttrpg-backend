@@ -28,6 +28,7 @@ export declare class Engine implements BattleRuleset {
     private areItemsSuppressed;
     private isGrounded;
     private compareActions;
+    private compareMoveActions;
     private actionPriority;
     private actionSpeed;
     private executeMove;
@@ -45,5 +46,6 @@ export declare class Engine implements BattleRuleset {
     private rollCrit;
     private getMultiHit;
     setProtect(pokemon: Pokemon, enabled: boolean): void;
+    getState(): BattleState;
 }
 export default Engine;

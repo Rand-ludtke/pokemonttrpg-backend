@@ -1238,6 +1238,11 @@ export class Engine implements BattleRuleset {
 		pokemon.volatile = pokemon.volatile || {};
 		(pokemon.volatile as any).protect = enabled;
 	}
+
+	// Get the current battle state
+	getState(): BattleState {
+		return this.state;
+	}
 }
 
 export default Engine;

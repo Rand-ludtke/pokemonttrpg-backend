@@ -81,230 +81,265 @@ class Engine {
             ...(a.type === 'move' ? { moveId: a.moveId, targetPokemonId: a.targetPokemonId } : {})
         }))));
         console.log('[Engine] processTurn - available pokemon IDs:', allPokemonIds);
-        // Filter fainted actors and illegal actions
-        const legalActions = actions.filter((a) => {
-            const pokemon = this.getPokemonById(a.pokemonId);
-            if (!pokemon) {
-                console.log(`[Engine] Action rejected: pokemonId "${a.pokemonId}" not found in state`);
+        // ============================================================
+        // PHASE 1: Process SWITCHES first (before any moves)
+        // This matches Pokemon Showdown's behavior: switches have order 103, moves have order 200
+        // Lower order executes first, so switches always go before moves.
+        // ============================================================
+        const switchActions = actions.filter((a) => a.type === "switch");
+        const moveActions = actions.filter((a) => a.type === "move");
+        // Sort switches by speed (higher speed switches first) with random tie-break
+        const sortedSwitches = [...switchActions].sort((a, b) => {
+            const speA = this.actionSpeed({ ...a, type: "switch" });
+            const speB = this.actionSpeed({ ...b, type: "switch" });
+            if (speA !== speB)
+                return speB - speA; // higher speed first
+            return this.rng() < 0.5 ? -1 : 1; // random tie-break
+        });
+        // Execute all switches BEFORE any moves
+        for (const switchAction of sortedSwitches) {
+            const player = this.state.players.find((p) => p.id === switchAction.actorPlayerId);
+            if (!player)
+                continue;
+            // Validate switch target is not fainted
+            const targetIndex = switchAction.toIndex;
+            const targetPokemon = player.team[targetIndex];
+            if (!targetPokemon || targetPokemon.currentHP <= 0) {
+                console.log(`[Engine] Switch rejected: target Pokemon at index ${targetIndex} is fainted or doesn't exist`);
+                continue;
+            }
+            // Validate not switching to self (already active)
+            if (targetIndex === player.activeIndex) {
+                console.log(`[Engine] Switch rejected: target Pokemon is already active`);
+                continue;
+            }
+            // Clear substitute and reset stages/volatiles on the outgoing mon
+            const outgoing = player.team[player.activeIndex];
+            if (outgoing) {
+                if (outgoing.volatile)
+                    outgoing.volatile.substituteHP = 0;
+                // Reset stages
+                outgoing.stages = { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, acc: 0, eva: 0 };
+                // Preserve PP store but clear other volatiles including Choice lock
+                const ppKeep = outgoing.volatile?.pp;
+                outgoing.volatile = { pp: ppKeep };
+            }
+            player.activeIndex = Math.max(0, Math.min(player.team.length - 1, targetIndex));
+            const active = player.team[player.activeIndex];
+            log(`${player.name} switched to ${active.name}!`);
+            this.emitSwitchIn(active, log);
+            anim.push({ type: "switch", payload: { playerId: player.id, pokemonId: active.id } });
+        }
+        // ============================================================
+        // PHASE 2: Process MOVES (after all switches are complete)
+        // Moves now target the CURRENT active Pokemon (after switches)
+        // ============================================================
+        // Filter legal move actions (actor must be alive and be the current active)
+        const legalMoveActions = moveActions.filter((a) => {
+            const player = this.state.players.find((p) => p.id === a.actorPlayerId);
+            if (!player) {
+                console.log(`[Engine] Action rejected: player "${a.actorPlayerId}" not found`);
                 return false;
             }
-            if (pokemon.currentHP <= 0) {
-                console.log(`[Engine] Action rejected: pokemonId "${a.pokemonId}" is fainted`);
+            // The action's pokemonId should match the current active Pokemon
+            const currentActive = player.team[player.activeIndex];
+            if (!currentActive || currentActive.currentHP <= 0) {
+                console.log(`[Engine] Action rejected: player's active Pokemon is fainted`);
                 return false;
             }
+            // Accept the action - we'll use the current active, not the pokemonId from the action
+            // This handles the case where a player switched but also sent a move action
             return true;
         });
-        console.log('[Engine] processTurn - legal actions after filter:', legalActions.length);
-        // Determine coin flip winner once (decides who acts first when priority ties)
-        if (!this.state.coinFlipWinner && this.state.players.length >= 2) {
-            const idx = this.rng() < 0.5 ? 0 : 1;
-            const winner = this.state.players[idx];
-            if (winner) {
-                this.state.coinFlipWinner = winner.id;
-                log(`${winner.name} wins the coin flip and will act first this battle.`);
-            }
-        }
-        // Sort by priority then speed (reverse speed under Trick Room)
-        const sorted = [...legalActions].sort((a, b) => this.compareActions(a, b));
-        // Execute
-        for (const action of sorted) {
-            const actor = this.getPokemonById(action.pokemonId);
+        console.log('[Engine] processTurn - legal move actions after filter:', legalMoveActions.length);
+        // Sort moves by priority then speed, with random tie-break for true speed ties
+        // (This matches Pokemon Showdown's speedSort behavior)
+        const sortedMoves = [...legalMoveActions].sort((a, b) => this.compareMoveActions(a, b));
+        // Execute each move
+        for (const ma of sortedMoves) {
+            // Get the CURRENT active Pokemon for this player (after switches!)
+            const player = this.state.players.find((p) => p.id === ma.actorPlayerId);
+            if (!player)
+                continue;
+            const actor = player.team[player.activeIndex];
             if (!actor || actor.currentHP <= 0)
                 continue; // fainted already
-            if (action.type === "move") {
-                const ma = action;
-                // Status gating at start of action
-                if (actor.status === "sleep") {
-                    const turns = actor.volatile?.sleepTurns ?? 0;
-                    if (turns > 0) {
-                        actor.volatile = actor.volatile || {};
-                        actor.volatile.sleepTurns = Math.max(0, turns - 1);
-                        if (actor.volatile.sleepTurns > 0) {
-                            log(`${actor.name} is fast asleep.`);
-                            continue;
-                        }
-                        else {
-                            actor.status = "none";
-                            log(`${actor.name} woke up!`);
-                        }
-                    }
-                }
-                if (actor.status === "freeze") {
-                    const thaw = this.rng() < 0.2;
-                    if (thaw) {
-                        actor.status = "none";
-                        log(`${actor.name} thawed out!`);
+            // Find the opponent's CURRENT active Pokemon as the target (after switches!)
+            const opponentPlayer = this.state.players.find(pl => pl !== player);
+            let target = opponentPlayer ? opponentPlayer.team[opponentPlayer.activeIndex] : undefined;
+            // Override with explicit target if it's still valid
+            if (ma.targetPokemonId) {
+                const explicitTarget = this.getPokemonById(ma.targetPokemonId);
+                // Only use explicit target if it's the opponent's current active and alive
+                if (explicitTarget && explicitTarget.currentHP > 0 &&
+                    opponentPlayer?.team.some(m => m.id === explicitTarget.id)) {
+                    // If the explicit target is in opponent's team, but not active anymore
+                    // (they switched), still target the current active
+                    if (opponentPlayer.team[opponentPlayer.activeIndex]?.id !== explicitTarget.id) {
+                        console.log(`[Engine] Target switched out, redirecting to new active`);
                     }
                     else {
-                        log(`${actor.name} is frozen solid!`);
+                        target = explicitTarget;
+                    }
+                }
+            }
+            if (!target || target.currentHP <= 0) {
+                console.log(`[Engine] Move skipped: no valid target`);
+                continue;
+            }
+            // Status gating at start of action
+            if (actor.status === "sleep") {
+                const turns = actor.volatile?.sleepTurns ?? 0;
+                if (turns > 0) {
+                    actor.volatile = actor.volatile || {};
+                    actor.volatile.sleepTurns = Math.max(0, turns - 1);
+                    if (actor.volatile.sleepTurns > 0) {
+                        log(`${actor.name} is fast asleep.`);
                         continue;
                     }
+                    else {
+                        actor.status = "none";
+                        log(`${actor.name} woke up!`);
+                    }
                 }
-                if (actor.status === "paralysis") {
-                    if (this.rng() < 0.25) {
-                        log(`${actor.name} is paralyzed! It can't move!`);
+            }
+            if (actor.status === "freeze") {
+                const thaw = this.rng() < 0.2;
+                if (thaw) {
+                    actor.status = "none";
+                    log(`${actor.name} thawed out!`);
+                }
+                else {
+                    log(`${actor.name} is frozen solid!`);
+                    continue;
+                }
+            }
+            if (actor.status === "paralysis") {
+                if (this.rng() < 0.25) {
+                    log(`${actor.name} is paralyzed! It can't move!`);
+                    continue;
+                }
+            }
+            // Encore enforcement: if actor is encored, force the selected moveId
+            if ((actor.volatile?.encoreTurns ?? 0) > 0 && actor.volatile?.encoreMoveId) {
+                const forcedId = actor.volatile.encoreMoveId;
+                if (ma.moveId !== forcedId) {
+                    ma.moveId = forcedId;
+                }
+            }
+            let requested = actor.moves.find((m) => m.id === ma.moveId);
+            let move = requested;
+            actor.volatile = actor.volatile || {};
+            actor.volatile.pp = actor.volatile.pp || {};
+            const ppStore = actor.volatile.pp;
+            // Choice item lock enforcement: if holding a Choice item and locked, block other moves (ignored under Magic Room)
+            const hasChoice = ["choice_band", "choice_specs", "choice_scarf"].includes((actor.item ?? "").toLowerCase());
+            const lockedId = actor.volatile.choiceLockedMoveId;
+            if (!this.areItemsSuppressed() && hasChoice && lockedId && requested && requested.id !== lockedId) {
+                // Allow Struggle fallback path to handle when no PP remains on any move; otherwise block
+                log(`${actor.name} is locked into ${lockedId} due to its Choice item!`);
+                continue;
+            }
+            // Determine PP availability
+            const hasAnyPP = actor.moves.some(m => (ppStore[m.id] ?? (m.pp ?? 10)) > 0);
+            let usingStruggle = false;
+            if (!move) {
+                // Missing move definition: if no PP anywhere, fall back silently to Struggle
+                if (!hasAnyPP) {
+                    move = { id: "__struggle", name: "Struggle", type: "Normal", category: "Physical", power: 50 };
+                    usingStruggle = true;
+                }
+                else {
+                    continue;
+                }
+            }
+            else {
+                // Move exists: check its remaining PP
+                const basePP0 = move.pp ?? 10;
+                const remaining0 = ppStore[move.id] ?? basePP0;
+                if (remaining0 <= 0) {
+                    if (hasAnyPP) {
+                        log(`${actor.name} has no PP left for ${move.name}!`);
                         continue;
                     }
-                }
-                // Encore enforcement: if actor is encored, force the selected moveId
-                if ((actor.volatile?.encoreTurns ?? 0) > 0 && actor.volatile?.encoreMoveId) {
-                    const forcedId = actor.volatile.encoreMoveId;
-                    if (ma.moveId !== forcedId) {
-                        ma.moveId = forcedId;
-                    }
-                }
-                let requested = actor.moves.find((m) => m.id === ma.moveId);
-                let move = requested;
-                let target = this.getPokemonById(ma.targetPokemonId);
-                // Fallback: if target not found by ID, try to find opponent's active Pokemon
-                if (!target) {
-                    console.log(`[Engine] Target "${ma.targetPokemonId}" not found, attempting fallback...`);
-                    // Find the player this actor belongs to
-                    const actorPlayer = this.state.players.find(pl => pl.team.some(m => m.id === action.pokemonId));
-                    // Find opponent player
-                    const opponentPlayer = this.state.players.find(pl => pl !== actorPlayer);
-                    if (opponentPlayer) {
-                        target = opponentPlayer.team[opponentPlayer.activeIndex];
-                        console.log(`[Engine] Fallback target: ${target?.id} (${target?.name})`);
-                    }
-                }
-                if (!target) {
-                    console.log(`[Engine] Move skipped: no valid target for "${ma.moveId}" (targetPokemonId: "${ma.targetPokemonId}")`);
-                    continue;
-                }
-                actor.volatile = actor.volatile || {};
-                actor.volatile.pp = actor.volatile.pp || {};
-                const ppStore = actor.volatile.pp;
-                // Choice item lock enforcement: if holding a Choice item and locked, block other moves (ignored under Magic Room)
-                const hasChoice = ["choice_band", "choice_specs", "choice_scarf"].includes((actor.item ?? "").toLowerCase());
-                const lockedId = actor.volatile.choiceLockedMoveId;
-                if (!this.areItemsSuppressed() && hasChoice && lockedId && requested && requested.id !== lockedId) {
-                    // Allow Struggle fallback path to handle when no PP remains on any move; otherwise block
-                    log(`${actor.name} is locked into ${lockedId} due to its Choice item!`);
-                    continue;
-                }
-                // Determine PP availability
-                const hasAnyPP = actor.moves.some(m => (ppStore[m.id] ?? (m.pp ?? 10)) > 0);
-                let usingStruggle = false;
-                if (!move) {
-                    // Missing move definition: if no PP anywhere, fall back silently to Struggle
-                    if (!hasAnyPP) {
+                    else {
+                        // Log the PP exhaustion, then use Struggle
+                        log(`${actor.name} has no PP left for ${move.name}!`);
                         move = { id: "__struggle", name: "Struggle", type: "Normal", category: "Physical", power: 50 };
                         usingStruggle = true;
                     }
-                    else {
-                        continue;
-                    }
+                }
+            }
+            if (!move)
+                continue;
+            // At this point, either using Struggle or we have PP to use the move
+            const basePP = move.pp ?? 10;
+            const remaining = ppStore[move.id] ?? basePP;
+            log(`${actor.name} used ${move.name}!`);
+            anim.push({ type: "move:start", payload: { userId: actor.id, moveId: move.id } });
+            // Taunt: block Status-category moves while taunted (skip for Struggle)
+            if (!usingStruggle && (actor.volatile?.tauntTurns ?? 0) > 0 && move.category === "Status") {
+                log(`${actor.name} can't use status moves due to Taunt!`);
+                anim.push({ type: "status:taunt:block", payload: { userId: actor.id, moveId: move.id } });
+                continue;
+            }
+            // Disable: if this specific move is disabled, block it (skip for Struggle)
+            if (!usingStruggle && (actor.volatile?.disabledTurns ?? 0) > 0 && actor.volatile?.disabledMoveId === move.id) {
+                log(`${actor.name} can't use ${move.name} due to Disable!`);
+                anim.push({ type: "status:disable:block", payload: { userId: actor.id, moveId: move.id } });
+                continue;
+            }
+            // Torment: cannot use the same move twice in a row (skip for Struggle)
+            if (!usingStruggle && (actor.volatile?.tormentTurns ?? 0) > 0 && (actor.volatile?.lastMoveId === move.id)) {
+                log(`${actor.name} can't use ${move.name} twice in a row due to Torment!`);
+                anim.push({ type: "status:torment:block", payload: { userId: actor.id, moveId: move.id } });
+                continue;
+            }
+            // Track last used move for mechanics like Encore/Disable source
+            actor.volatile = actor.volatile || {};
+            actor.volatile.lastMoveId = move.id;
+            this.executeMove(move, actor, target, log);
+            // Struggle recoil: 25% of user's max HP after executing Struggle
+            if (usingStruggle && actor.currentHP > 0) {
+                const recoil = Math.max(1, Math.floor(actor.maxHP / 4));
+                const selfDmg = this.utils(log).dealDamage(actor, recoil);
+                log(`${actor.name} was hurt by recoil! (-${selfDmg})`);
+                anim.push({ type: "move:recoil", payload: { userId: actor.id, damage: selfDmg } });
+            }
+            // Set Choice lock after first successful move (skip Struggle) unless items are suppressed
+            if (!usingStruggle && hasChoice && !actor.volatile.choiceLockedMoveId && !this.areItemsSuppressed()) {
+                actor.volatile.choiceLockedMoveId = move.id;
+            }
+            // Decrement PP only on successful execution (skip for Struggle). Pressure causes -2 per use.
+            if (!usingStruggle) {
+                if (actor.volatile.skipPPThisAction) {
+                    actor.volatile.skipPPThisAction = false;
                 }
                 else {
-                    // Move exists: check its remaining PP
-                    const basePP0 = move.pp ?? 10;
-                    const remaining0 = ppStore[move.id] ?? basePP0;
-                    if (remaining0 <= 0) {
-                        if (hasAnyPP) {
-                            log(`${actor.name} has no PP left for ${move.name}!`);
-                            continue;
-                        }
-                        else {
-                            // Log the PP exhaustion, then use Struggle
-                            log(`${actor.name} has no PP left for ${move.name}!`);
-                            move = { id: "__struggle", name: "Struggle", type: "Normal", category: "Physical", power: 50 };
-                            usingStruggle = true;
-                        }
-                    }
+                    let dec = 1;
+                    const targetHasPressure = (target.ability === "pressure");
+                    if (targetHasPressure)
+                        dec = 2;
+                    ppStore[move.id] = Math.max(0, (ppStore[move.id] ?? basePP) - dec);
                 }
-                if (!move)
-                    continue;
-                // At this point, either using Struggle or we have PP to use the move
-                const basePP = move.pp ?? 10;
-                const remaining = ppStore[move.id] ?? basePP;
-                log(`${actor.name} used ${move.name}!`);
-                anim.push({ type: "move:start", payload: { userId: actor.id, moveId: move.id } });
-                // Taunt: block Status-category moves while taunted (skip for Struggle)
-                if (!usingStruggle && (actor.volatile?.tauntTurns ?? 0) > 0 && move.category === "Status") {
-                    log(`${actor.name} can't use status moves due to Taunt!`);
-                    anim.push({ type: "status:taunt:block", payload: { userId: actor.id, moveId: move.id } });
-                    continue;
-                }
-                // Disable: if this specific move is disabled, block it (skip for Struggle)
-                if (!usingStruggle && (actor.volatile?.disabledTurns ?? 0) > 0 && actor.volatile?.disabledMoveId === move.id) {
-                    log(`${actor.name} can't use ${move.name} due to Disable!`);
-                    anim.push({ type: "status:disable:block", payload: { userId: actor.id, moveId: move.id } });
-                    continue;
-                }
-                // Torment: cannot use the same move twice in a row (skip for Struggle)
-                if (!usingStruggle && (actor.volatile?.tormentTurns ?? 0) > 0 && (actor.volatile?.lastMoveId === move.id)) {
-                    log(`${actor.name} can't use ${move.name} twice in a row due to Torment!`);
-                    anim.push({ type: "status:torment:block", payload: { userId: actor.id, moveId: move.id } });
-                    continue;
-                }
-                // Track last used move for mechanics like Encore/Disable source
-                actor.volatile = actor.volatile || {};
-                actor.volatile.lastMoveId = move.id;
-                this.executeMove(move, actor, target, log);
-                // Struggle recoil: 25% of user's max HP after executing Struggle
-                if (usingStruggle && actor.currentHP > 0) {
-                    const recoil = Math.max(1, Math.floor(actor.maxHP / 4));
+            }
+            // Life Orb recoil only if a damaging move dealt damage this turn, unless items are suppressed
+            if (!this.areItemsSuppressed() && actor.item === "life_orb" && move.category !== "Status") {
+                // naive check: if target took any damage this action (totalDealt tracked? we infer by lastMoveId + target hp change)
+                // Simpler: emit a marker on actor when executeMove dealt damage; read and clear here
+                if (actor.volatile.dealtDamageThisAction) {
+                    const recoil = Math.max(1, Math.floor(actor.maxHP / 10));
                     const selfDmg = this.utils(log).dealDamage(actor, recoil);
-                    log(`${actor.name} was hurt by recoil! (-${selfDmg})`);
-                    anim.push({ type: "move:recoil", payload: { userId: actor.id, damage: selfDmg } });
-                }
-                // Set Choice lock after first successful move (skip Struggle) unless items are suppressed
-                if (!usingStruggle && hasChoice && !actor.volatile.choiceLockedMoveId && !this.areItemsSuppressed()) {
-                    actor.volatile.choiceLockedMoveId = move.id;
-                }
-                // Decrement PP only on successful execution (skip for Struggle). Pressure causes -2 per use.
-                if (!usingStruggle) {
-                    if (actor.volatile.skipPPThisAction) {
-                        actor.volatile.skipPPThisAction = false;
-                    }
-                    else {
-                        let dec = 1;
-                        const targetHasPressure = (target.ability === "pressure");
-                        if (targetHasPressure)
-                            dec = 2;
-                        ppStore[move.id] = Math.max(0, (ppStore[move.id] ?? basePP) - dec);
-                    }
-                }
-                // Life Orb recoil only if a damaging move dealt damage this turn, unless items are suppressed
-                if (!this.areItemsSuppressed() && actor.item === "life_orb" && move.category !== "Status") {
-                    // naive check: if target took any damage this action (totalDealt tracked? we infer by lastMoveId + target hp change)
-                    // Simpler: emit a marker on actor when executeMove dealt damage; read and clear here
-                    if (actor.volatile.dealtDamageThisAction) {
-                        const recoil = Math.max(1, Math.floor(actor.maxHP / 10));
-                        const selfDmg = this.utils(log).dealDamage(actor, recoil);
-                        log(`${actor.name} is hurt by its Life Orb! (-${selfDmg})`);
-                        anim.push({ type: "item:life-orb:recoil", payload: { pokemonId: actor.id, damage: selfDmg } });
-                        actor.volatile.dealtDamageThisAction = false;
-                    }
-                }
-                if (target.currentHP <= 0) {
-                    log(`${target.name} fainted!`);
-                    anim.push({ type: "pokemon:faint", payload: { pokemonId: target.id } });
+                    log(`${actor.name} is hurt by its Life Orb! (-${selfDmg})`);
+                    anim.push({ type: "item:life-orb:recoil", payload: { pokemonId: actor.id, damage: selfDmg } });
+                    actor.volatile.dealtDamageThisAction = false;
                 }
             }
-            else if (action.type === "switch") {
-                // Basic switch: change active index
-                const player = this.state.players.find((p) => p.id === action.actorPlayerId);
-                if (!player)
-                    continue;
-                // Clear substitute and reset stages/volatiles on the outgoing mon (substitute doesn't persist on switch)
-                const outgoing = player.team[player.activeIndex];
-                if (outgoing) {
-                    if (outgoing.volatile)
-                        outgoing.volatile.substituteHP = 0;
-                    // Reset stages
-                    outgoing.stages = { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, acc: 0, eva: 0 };
-                    // Preserve PP store but clear other volatiles including Choice lock and temporary effects
-                    const ppKeep = outgoing.volatile?.pp;
-                    outgoing.volatile = { pp: ppKeep };
-                }
-                player.activeIndex = Math.max(0, Math.min(player.team.length - 1, action.toIndex));
-                const active = player.team[player.activeIndex];
-                log(`${player.name} switched to ${active.name}!`);
-                this.emitSwitchIn(active, log);
-                anim.push({ type: "switch", payload: { playerId: player.id, pokemonId: active.id } });
+            if (target.currentHP <= 0) {
+                log(`${target.name} fainted!`);
+                anim.push({ type: "pokemon:faint", payload: { pokemonId: target.id } });
             }
+            // NOTE: Switches are processed in Phase 1, before any moves, so no switch handling here
         }
         // End-of-turn effects (statuses, items, weather, terrain)
         for (const p of this.state.players) {
@@ -605,20 +640,38 @@ class Engine {
         const priorityB = b.type === "switch" ? 6 : this.actionPriority(b);
         if (priorityA !== priorityB)
             return priorityB - priorityA; // higher first
-        // Coin flip winner acts first (unless both actions belong to same player)
-        const coinWinner = this.state.coinFlipWinner;
-        if (coinWinner) {
-            const aCoin = a.actorPlayerId === coinWinner;
-            const bCoin = b.actorPlayerId === coinWinner;
-            if (aCoin !== bCoin)
-                return aCoin ? -1 : 1;
-        }
-        // Speed tiebreaker within same side (still needed for doubles or mirror actions)
+        // Speed comparison (note: actionSpeed accounts for Trick Room)
         const speA = this.actionSpeed(a);
         const speB = this.actionSpeed(b);
         if (speA !== speB)
-            return speB - speA; // higher first (note: actionSpeed accounts for Trick Room)
-        // Random tie-break
+            return speB - speA; // higher speed first
+        // TRUE SPEED TIE: same priority AND same speed
+        // Random tie-break each time (matches Pokemon Showdown's behavior)
+        return this.rng() < 0.5 ? -1 : 1;
+    }
+    // Compare move actions only (for Phase 2 sorting after switches)
+    compareMoveActions(a, b) {
+        // Get the CURRENT active Pokemon for each player (after switches!)
+        const playerA = this.state.players.find(p => p.id === a.actorPlayerId);
+        const playerB = this.state.players.find(p => p.id === b.actorPlayerId);
+        const actorA = playerA?.team[playerA.activeIndex];
+        const actorB = playerB?.team[playerB.activeIndex];
+        // Move priority comparison
+        const moveA = actorA?.moves.find(m => m.id === a.moveId);
+        const moveB = actorB?.moves.find(m => m.id === b.moveId);
+        const priorityA = moveA?.priority ?? 0;
+        const priorityB = moveB?.priority ?? 0;
+        if (priorityA !== priorityB)
+            return priorityB - priorityA; // higher priority first
+        // Speed comparison using current active Pokemon
+        const speA = actorA ? this.getEffectiveSpeed(actorA) : 0;
+        const speB = actorB ? this.getEffectiveSpeed(actorB) : 0;
+        const trickRoom = this.state.field.room.id === "trick_room";
+        const adjustedSpeA = trickRoom ? -speA : speA;
+        const adjustedSpeB = trickRoom ? -speB : speB;
+        if (adjustedSpeA !== adjustedSpeB)
+            return adjustedSpeB - adjustedSpeA; // higher speed first
+        // TRUE SPEED TIE: random each time
         return this.rng() < 0.5 ? -1 : 1;
     }
     actionPriority(a) {
@@ -844,7 +897,9 @@ class Engine {
                 log(`It doesn't affect ${target.name}...`);
                 return;
             }
-            log(`It dealt ${totalDealt} damage${hits > 1 ? ` in ${hits} hits` : ""}.`);
+            // Calculate damage as percentage of max HP
+            const damagePercent = target.maxHP > 0 ? ((totalDealt / target.maxHP) * 100).toFixed(2) : '0.00';
+            log(`It dealt ${damagePercent}% damage${hits > 1 ? ` in ${hits} hits` : ""}.`);
             if (critHappened)
                 log("A critical hit!");
             if (effectivenessSeen > 1)
@@ -1188,6 +1243,10 @@ class Engine {
     setProtect(pokemon, enabled) {
         pokemon.volatile = pokemon.volatile || {};
         pokemon.volatile.protect = enabled;
+    }
+    // Get the current battle state
+    getState() {
+        return this.state;
     }
 }
 exports.Engine = Engine;

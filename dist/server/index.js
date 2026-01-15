@@ -45,10 +45,13 @@ const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const uuid_1 = require("uuid");
 const engine_1 = __importDefault(require("../engine"));
+const sync_ps_engine_1 = __importDefault(require("../sync-ps-engine"));
 const abilities_1 = require("../data/abilities");
 const items_1 = require("../data/items");
 const showdown_converter_1 = require("../data/converters/showdown-converter");
 const showdown_species_moves_1 = require("../data/converters/showdown-species-moves");
+// Configuration: Use Pokemon Showdown engine (true) or custom engine (false)
+const USE_PS_ENGINE = process.env.USE_PS_ENGINE !== "false"; // Default to PS engine
 // Simple JSON persistence directories (for Raspberry Pi prototype)
 const DATA_DIR = path_1.default.resolve(process.cwd(), "data");
 const REPLAYS_DIR = path_1.default.join(DATA_DIR, "replays");
@@ -256,7 +259,7 @@ app.get("/api/rooms/:id/snapshot", (req, res) => {
     if (!room || !room.engine)
         return res.status(404).json({ error: "room not found or battle not started" });
     const needsSwitch = room.forceSwitchNeeded ? Array.from(room.forceSwitchNeeded) : [];
-    const state = room.engine["state"];
+    const state = room.engine.getState();
     res.json({ state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch, deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
 });
 const server = http_1.default.createServer(app);
@@ -283,7 +286,9 @@ function startTeamPreview(room, players, rules) {
     room.teamPreviewPlayers = players;
     room.teamPreviewOrders = {};
     room.teamPreviewRules = rules;
-    // Send team preview request to each player
+    // Emit teamPreviewStarted FIRST so client can mount the battle tab before receiving prompts
+    io.to(room.id).emit("teamPreviewStarted", { roomId: room.id });
+    // Send team preview request to each player (after tab is mounted)
     for (let i = 0; i < players.length; i++) {
         const player = players[i];
         const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
@@ -340,7 +345,6 @@ function startTeamPreview(room, players, rules) {
             },
         });
     }
-    io.to(room.id).emit("teamPreviewStarted", { roomId: room.id });
 }
 function applyTeamOrder(player, order) {
     if (!order || !order.length)
@@ -389,7 +393,15 @@ function beginBattle(room, players, seed, rules) {
         return;
     }
     const battleSeed = seed ?? 123;
-    room.engine = new engine_1.default({ seed: battleSeed });
+    // Use Pokemon Showdown engine or custom engine based on configuration
+    if (USE_PS_ENGINE) {
+        console.log(`[Server] Using Pokemon Showdown battle engine`);
+        room.engine = new sync_ps_engine_1.default({ format: "gen9customgame", seed: battleSeed });
+    }
+    else {
+        console.log(`[Server] Using custom battle engine`);
+        room.engine = new engine_1.default({ seed: battleSeed });
+    }
     room.turnBuffer = {};
     room.replay = [];
     clearForceSwitchTimer(room);
@@ -452,6 +464,47 @@ function emitMovePrompts(room, state) {
             playerId: player.id,
             prompt: moveRequest,
             state: state, // Include full battle state so client always has it
+        });
+    }
+}
+// Emit force-switch prompts to players who need to switch due to fainted Pokemon
+function emitForceSwitchPrompts(room, state, needsSwitch) {
+    for (const playerId of needsSwitch) {
+        const playerSocket = room.players.find(p => p.id === playerId)?.socketId;
+        if (!playerSocket)
+            continue;
+        const sock = io.sockets.sockets.get(playerSocket);
+        if (!sock)
+            continue;
+        const player = state.players.find(p => p.id === playerId);
+        if (!player)
+            continue;
+        const sideIndex = state.players.indexOf(player);
+        const switchRequest = {
+            forceSwitch: [true], // Single slot
+            side: {
+                id: `p${sideIndex + 1}`,
+                name: player.name,
+                pokemon: player.team.map((p, idx) => ({
+                    id: p.id,
+                    pokemonId: p.id,
+                    ident: `p${sideIndex + 1}: ${p.name}`,
+                    details: `${p.species}, L${p.level}`,
+                    condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+                    active: idx === player.activeIndex,
+                    stats: p.stats,
+                    moves: p.moves,
+                    item: p.item,
+                    ability: p.ability,
+                    fainted: p.currentHP <= 0,
+                })),
+            },
+        };
+        sock.emit("promptAction", {
+            roomId: room.id,
+            playerId: player.id,
+            prompt: switchRequest,
+            state: state,
         });
     }
 }
@@ -562,7 +615,7 @@ function startForceSwitchTimer(room) {
             return;
         // Auto-switch remaining players to first healthy bench
         for (const pid of Array.from(room.forceSwitchNeeded)) {
-            const state = room.engine["state"];
+            const state = room.engine.getState();
             const pl = state.players.find(p => p.id === pid);
             if (!pl)
                 continue;
@@ -573,11 +626,14 @@ function startForceSwitchTimer(room) {
                 room.forceSwitchNeeded.delete(pid);
             }
         }
-        io.to(room.id).emit("battleUpdate", { result: { state: room.engine["state"], events: [], anim: [] }, needsSwitch: Array.from(room.forceSwitchNeeded ?? []) });
+        io.to(room.id).emit("battleUpdate", { result: { state: room.engine.getState(), events: [], anim: [] }, needsSwitch: Array.from(room.forceSwitchNeeded ?? []) });
         if (room.forceSwitchNeeded.size === 0) {
             room.phase = "normal";
             io.to(room.id).emit("phase", { phase: room.phase });
             clearForceSwitchTimer(room);
+            // Emit new move prompts so players can choose their next action
+            const freshState = room.engine.getState();
+            emitMovePrompts(room, freshState);
         }
         else {
             // Extend time for any still-required (optional). For simplicity, clear deadline and keep old until manual switches.
@@ -619,7 +675,7 @@ io.on("connection", (socket) => {
             room.spectators.push({ id: user.id, username: user.username, socketId: socket.id });
             // Send spectator snapshot if battle started
             if (room.battleStarted && room.engine) {
-                const state = room.engine["state"];
+                const state = room.engine.getState();
                 socket.emit("spectate_start", { state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch: Array.from(room.forceSwitchNeeded ?? []), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
             }
         }
@@ -632,8 +688,14 @@ io.on("connection", (socket) => {
             return socket.emit("error", { error: "room not found" });
         if (room.battleStarted)
             return;
-        room.engine = new engine_1.default({ seed: data.seed ?? 123 });
-        const state = room.engine.initializeBattle(data.players, { seed: data.seed ?? 123 });
+        const battleSeed = data.seed ?? 123;
+        if (USE_PS_ENGINE) {
+            room.engine = new sync_ps_engine_1.default({ format: "gen9customgame", seed: battleSeed });
+        }
+        else {
+            room.engine = new engine_1.default({ seed: battleSeed });
+        }
+        const state = room.engine.initializeBattle(data.players, { seed: battleSeed });
         room.battleStarted = true;
         room.phase = "normal";
         room.forceSwitchNeeded = new Set();
@@ -693,12 +755,24 @@ io.on("connection", (socket) => {
             if (data.action.type !== "switch") {
                 return socket.emit("error", { error: "must switch due to faint" });
             }
+            // Validate switch target is not fainted
+            const forceSwitchState = room.engine.getState();
+            const forceSwitchPlayer = forceSwitchState.players.find(p => p.id === data.playerId);
+            if (forceSwitchPlayer) {
+                const targetMon = forceSwitchPlayer.team[data.action.toIndex];
+                if (!targetMon || targetMon.currentHP <= 0) {
+                    return socket.emit("error", { error: "cannot switch to a fainted Pokemon" });
+                }
+                if (data.action.toIndex === forceSwitchPlayer.activeIndex) {
+                    return socket.emit("error", { error: "cannot switch to the same Pokemon" });
+                }
+            }
             // Perform immediate forced switch via engine
             const res = room.engine.forceSwitch(data.playerId, data.action.toIndex);
             room.replay.push({ turn: res.state.turn, events: res.events, anim: res.anim, phase: "force-switch" });
             room.forceSwitchNeeded.delete(data.playerId);
             {
-                const s = room.engine["state"];
+                const s = room.engine.getState();
                 io.to(room.id).emit("battleUpdate", { result: res, needsSwitch: Array.from(room.forceSwitchNeeded), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: s.field.room, magic: s.field.magicRoom, wonder: s.field.wonderRoom } });
             }
             if (room.forceSwitchNeeded.size === 0) {
@@ -706,14 +780,29 @@ io.on("connection", (socket) => {
                 io.to(room.id).emit("phase", { phase: room.phase });
                 clearForceSwitchTimer(room);
                 // Emit new move prompts so players can choose their next action
-                const freshState = room.engine["state"];
+                const freshState = room.engine.getState();
                 emitMovePrompts(room, freshState);
             }
             return;
         }
+        // Validate switch actions before buffering
+        if (data.action.type === "switch") {
+            const normalState = room.engine.getState();
+            const normalPlayer = normalState.players.find(p => p.id === data.playerId);
+            if (normalPlayer) {
+                const targetMon = normalPlayer.team[data.action.toIndex];
+                if (!targetMon || targetMon.currentHP <= 0) {
+                    return socket.emit("error", { error: "cannot switch to a fainted Pokemon" });
+                }
+                if (data.action.toIndex === normalPlayer.activeIndex) {
+                    return socket.emit("error", { error: "cannot switch to the same Pokemon" });
+                }
+            }
+        }
         room.turnBuffer[data.playerId] = data.action;
         console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(data.action));
-        const expected = room.engine["state"].players.length; // internal access for quick prototype
+        const currentState = room.engine.getState();
+        const expected = currentState.players.length;
         console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
         if (Object.keys(room.turnBuffer).length >= expected) {
             const actions = Object.values(room.turnBuffer);
@@ -729,6 +818,8 @@ io.on("connection", (socket) => {
                 room.forceSwitchNeeded = new Set(needsSwitch);
                 io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
                 startForceSwitchTimer(room);
+                // Emit force-switch prompts to players who need to switch
+                emitForceSwitchPrompts(room, result.state, needsSwitch);
             }
             io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
             // Simple end detection: if any player's active mon is fainted and no healthy mons remain

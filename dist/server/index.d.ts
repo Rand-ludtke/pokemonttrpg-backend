@@ -1,9 +1,11 @@
 import Engine from "../engine";
+import SyncPSEngine from "../sync-ps-engine";
 import { Action, Player } from "../types";
 export interface ClientInfo {
     id: string;
     username: string;
 }
+type BattleEngine = Engine | SyncPSEngine;
 export interface Room {
     id: string;
     name: string;
@@ -17,7 +19,7 @@ export interface Room {
         username: string;
         socketId: string;
     }[];
-    engine?: Engine;
+    engine?: BattleEngine;
     battleStarted: boolean;
     turnBuffer: Record<string, Action>;
     replay: any[];

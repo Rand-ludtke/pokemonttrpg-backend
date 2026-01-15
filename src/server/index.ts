@@ -5,12 +5,16 @@ import path from "path";
 import fs from "fs";
 import { v4 as uuidv4 } from "uuid";
 import Engine from "../engine";
+import SyncPSEngine from "../sync-ps-engine";
 import { Action, MoveAction, Player, TurnResult, BattleState } from "../types";
 import { ExternalDexData } from "../adapters/pokedex-adapter";
 import { mergeAbilities } from "../data/abilities";
 import { mergeItems } from "../data/items";
 import { convertShowdownAbilities, convertShowdownItems } from "../data/converters/showdown-converter";
 import { convertShowdownSpecies, convertShowdownMoves } from "../data/converters/showdown-species-moves";
+
+// Configuration: Use Pokemon Showdown engine (true) or custom engine (false)
+const USE_PS_ENGINE = process.env.USE_PS_ENGINE !== "false"; // Default to PS engine
 
 // Simple JSON persistence directories (for Raspberry Pi prototype)
 const DATA_DIR = path.resolve(process.cwd(), "data");
@@ -24,12 +28,15 @@ export interface ClientInfo {
   username: string;
 }
 
+// Union type for either engine
+type BattleEngine = Engine | SyncPSEngine;
+
 export interface Room {
   id: string;
   name: string;
   players: { id: string; username: string; socketId: string }[];
   spectators: { id: string; username: string; socketId: string }[];
-  engine?: Engine;
+  engine?: BattleEngine;
   battleStarted: boolean;
   turnBuffer: Record<string, Action>; // keyed by player id
   replay: any[];
@@ -290,7 +297,7 @@ app.get("/api/rooms/:id/snapshot", (req: Request, res: Response) => {
   const room = rooms.get(req.params.id);
   if (!room || !room.engine) return res.status(404).json({ error: "room not found or battle not started" });
   const needsSwitch = room.forceSwitchNeeded ? Array.from(room.forceSwitchNeeded) : [];
-  const state = (room.engine as any)["state"] as import("../types").BattleState;
+  const state = room.engine.getState();
   res.json({ state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch, deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
 });
 
@@ -436,7 +443,16 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   }
   
   const battleSeed = seed ?? 123;
-  room.engine = new Engine({ seed: battleSeed });
+  
+  // Use Pokemon Showdown engine or custom engine based on configuration
+  if (USE_PS_ENGINE) {
+    console.log(`[Server] Using Pokemon Showdown battle engine`);
+    room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed });
+  } else {
+    console.log(`[Server] Using custom battle engine`);
+    room.engine = new Engine({ seed: battleSeed });
+  }
+  
   room.turnBuffer = {};
   room.replay = [];
   clearForceSwitchTimer(room);
@@ -654,7 +670,7 @@ function startForceSwitchTimer(room: Room) {
     if (!room.engine || !room.forceSwitchNeeded || room.forceSwitchNeeded.size === 0) return;
     // Auto-switch remaining players to first healthy bench
     for (const pid of Array.from(room.forceSwitchNeeded)) {
-      const state = (room.engine as any)["state"] as import("../types").BattleState;
+      const state = room.engine.getState();
       const pl = state.players.find(p => p.id === pid);
       if (!pl) continue;
       const benchIndex = pl.team.findIndex((m, idx) => idx !== pl.activeIndex && m.currentHP > 0);
@@ -664,13 +680,13 @@ function startForceSwitchTimer(room: Room) {
         room.forceSwitchNeeded.delete(pid);
       }
     }
-    io.to(room.id).emit("battleUpdate", { result: { state: (room.engine as any)["state"], events: [], anim: [] }, needsSwitch: Array.from(room.forceSwitchNeeded ?? []) });
+    io.to(room.id).emit("battleUpdate", { result: { state: room.engine.getState(), events: [], anim: [] }, needsSwitch: Array.from(room.forceSwitchNeeded ?? []) });
     if (room.forceSwitchNeeded.size === 0) {
       room.phase = "normal";
       io.to(room.id).emit("phase", { phase: room.phase });
       clearForceSwitchTimer(room);
       // Emit new move prompts so players can choose their next action
-      const freshState = (room.engine as any)["state"] as import("../types").BattleState;
+      const freshState = room.engine.getState();
       emitMovePrompts(room, freshState);
     } else {
       // Extend time for any still-required (optional). For simplicity, clear deadline and keep old until manual switches.
@@ -714,7 +730,7 @@ io.on("connection", (socket: Socket) => {
       room.spectators.push({ id: user.id, username: user.username, socketId: socket.id });
       // Send spectator snapshot if battle started
       if (room.battleStarted && room.engine) {
-  const state = (room.engine as any)["state"] as import("../types").BattleState;
+  const state = room.engine.getState();
   socket.emit("spectate_start", { state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch: Array.from(room.forceSwitchNeeded ?? []), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
       }
     }
@@ -726,8 +742,15 @@ io.on("connection", (socket: Socket) => {
     const room = rooms.get(data.roomId);
     if (!room) return socket.emit("error", { error: "room not found" });
     if (room.battleStarted) return;
-    room.engine = new Engine({ seed: data.seed ?? 123 });
-    const state = room.engine.initializeBattle(data.players, { seed: data.seed ?? 123 });
+    
+    const battleSeed = data.seed ?? 123;
+    if (USE_PS_ENGINE) {
+      room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed });
+    } else {
+      room.engine = new Engine({ seed: battleSeed });
+    }
+    
+    const state = room.engine.initializeBattle(data.players, { seed: battleSeed });
     room.battleStarted = true;
     room.phase = "normal";
     room.forceSwitchNeeded = new Set();
@@ -787,7 +810,7 @@ io.on("connection", (socket: Socket) => {
         return socket.emit("error", { error: "must switch due to faint" });
       }
       // Validate switch target is not fainted
-      const forceSwitchState = (room.engine as any)["state"] as import("../types").BattleState;
+      const forceSwitchState = room.engine.getState();
       const forceSwitchPlayer = forceSwitchState.players.find(p => p.id === data.playerId);
       if (forceSwitchPlayer) {
         const targetMon = forceSwitchPlayer.team[(data.action as any).toIndex];
@@ -803,7 +826,7 @@ io.on("connection", (socket: Socket) => {
       room.replay.push({ turn: res.state.turn, events: res.events, anim: res.anim, phase: "force-switch" });
       room.forceSwitchNeeded.delete(data.playerId);
       {
-        const s = (room.engine as any)["state"] as import("../types").BattleState;
+        const s = room.engine.getState();
         io.to(room.id).emit("battleUpdate", { result: res, needsSwitch: Array.from(room.forceSwitchNeeded), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: s.field.room, magic: s.field.magicRoom, wonder: s.field.wonderRoom } });
       }
       if (room.forceSwitchNeeded.size === 0) {
@@ -811,14 +834,14 @@ io.on("connection", (socket: Socket) => {
         io.to(room.id).emit("phase", { phase: room.phase });
         clearForceSwitchTimer(room);
         // Emit new move prompts so players can choose their next action
-        const freshState = (room.engine as any)["state"] as import("../types").BattleState;
+        const freshState = room.engine.getState();
         emitMovePrompts(room, freshState);
       }
       return;
     }
     // Validate switch actions before buffering
     if (data.action.type === "switch") {
-      const normalState = (room.engine as any)["state"] as import("../types").BattleState;
+      const normalState = room.engine.getState();
       const normalPlayer = normalState.players.find(p => p.id === data.playerId);
       if (normalPlayer) {
         const targetMon = normalPlayer.team[(data.action as any).toIndex];
@@ -832,7 +855,8 @@ io.on("connection", (socket: Socket) => {
     }
     room.turnBuffer[data.playerId] = data.action;
     console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(data.action));
-    const expected = room.engine["state"].players.length; // internal access for quick prototype
+    const currentState = room.engine.getState();
+    const expected = currentState.players.length;
     console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
     if (Object.keys(room.turnBuffer).length >= expected) {
       const actions = Object.values(room.turnBuffer);
