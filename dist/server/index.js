@@ -432,22 +432,36 @@ function emitMovePrompts(room, state) {
         const active = player.team[player.activeIndex];
         if (!active || active.currentHP <= 0)
             continue;
+        // Try to get the actual request from PS engine (has real PP values)
+        let psRequest = null;
+        if (room.engine instanceof sync_ps_engine_1.default) {
+            psRequest = room.engine.getRequest(player.id);
+        }
+        // Get moves from PS request if available (has accurate PP)
+        const psActiveMoves = psRequest?.active?.[0]?.moves || [];
         // Build the move request similar to PS format
         const moveRequest = {
             requestType: 'move',
             side: player.id,
             playerId: player.id,
+            rqid: Date.now(), // Add request ID for client tracking
             active: [{
                     id: active.id,
                     pokemonId: active.id,
-                    moves: (active.moves || []).map((move, idx) => ({
-                        id: typeof move === 'string' ? move : move.id || move.name || `move${idx}`,
-                        name: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
-                        pp: (active.volatile?.pp?.[typeof move === 'string' ? move : move.id] ?? move.pp ?? 10),
-                        maxpp: move.maxpp ?? move.pp ?? 10,
-                        target: move.target || 'normal',
-                        disabled: move.disabled || false,
-                    })),
+                    moves: (active.moves || []).map((move, idx) => {
+                        const moveId = typeof move === 'string' ? move : move.id || move.name || `move${idx}`;
+                        // Find corresponding PS move for accurate PP
+                        const psMove = psActiveMoves.find((m) => m.id === moveId || m.id === moveId.toLowerCase().replace(/\s/g, ''));
+                        return {
+                            id: moveId,
+                            name: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
+                            // Use PS move PP if available, otherwise fallback
+                            pp: psMove?.pp ?? (active.volatile?.pp?.[moveId] ?? move.pp ?? 10),
+                            maxpp: psMove?.maxpp ?? move.maxpp ?? move.pp ?? 10,
+                            target: psMove?.target || move.target || 'normal',
+                            disabled: psMove?.disabled || move.disabled || false,
+                        };
+                    }),
                     canSwitch: player.team.filter((p, i) => i !== player.activeIndex && p.currentHP > 0).length > 0,
                 }],
             pokemon: player.team.map((p, idx) => ({
@@ -803,8 +817,52 @@ io.on("connection", (socket) => {
                 }
             }
         }
-        room.turnBuffer[data.playerId] = data.action;
-        console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(data.action));
+        // Convert moveIndex-based action to moveId-based action
+        // Client sends { type: 'move', moveIndex: 0 }, we need to convert to { type: 'move', moveId: '...', pokemonId: '...', ... }
+        let processedAction = data.action;
+        if (data.action.type === "move" && typeof data.action.moveIndex === "number") {
+            const moveState = room.engine.getState();
+            const movePlayer = moveState.players.find(p => p.id === data.playerId);
+            if (movePlayer) {
+                const activePokemon = movePlayer.team[movePlayer.activeIndex];
+                const moveIndex = data.action.moveIndex;
+                const move = activePokemon?.moves?.[moveIndex];
+                if (move) {
+                    const moveId = typeof move === 'string' ? move : (move.id || move.name);
+                    // Find opponent for target
+                    const opponent = moveState.players.find(p => p.id !== data.playerId);
+                    const opponentActive = opponent?.team[opponent.activeIndex];
+                    processedAction = {
+                        type: "move",
+                        actorPlayerId: data.playerId,
+                        pokemonId: activePokemon.id,
+                        moveId: moveId,
+                        targetPlayerId: opponent?.id || "",
+                        targetPokemonId: opponentActive?.id || "",
+                    };
+                    console.log(`[Server] Converted moveIndex ${moveIndex} to moveId ${moveId}`);
+                }
+            }
+        }
+        // Handle switch action - client may send switchTo or toIndex
+        if (data.action.type === "switch") {
+            const switchState = room.engine.getState();
+            const switchPlayer = switchState.players.find(p => p.id === data.playerId);
+            if (switchPlayer) {
+                const activePokemon = switchPlayer.team[switchPlayer.activeIndex];
+                // Support both switchTo (legacy) and toIndex
+                const targetIndex = data.action.toIndex ?? data.action.switchTo;
+                processedAction = {
+                    type: "switch",
+                    actorPlayerId: data.playerId,
+                    pokemonId: activePokemon?.id || "",
+                    toIndex: targetIndex,
+                };
+                console.log(`[Server] Processed switch action to index ${targetIndex}`);
+            }
+        }
+        room.turnBuffer[data.playerId] = processedAction;
+        console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(processedAction));
         const currentState = room.engine.getState();
         const expected = currentState.players.length;
         console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);

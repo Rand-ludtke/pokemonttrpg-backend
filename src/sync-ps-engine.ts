@@ -427,12 +427,36 @@ export class SyncPSEngine {
 			const player = this.state.players[sideIdx];
 			if (!psSide || !player) continue;
 
-			// Find active index - PS client uses .slot, server uses .position
-			// Try both to be safe, prefer slot for client compatibility
+			// Find active index - PS's active[0] is a reference to an object in psSide.pokemon
 			const activePokemon = psSide.active[0];
-			const activeSlot = activePokemon?.slot ?? activePokemon?.position;
-			if (typeof activeSlot === "number" && activeSlot >= 0) {
-				player.activeIndex = activeSlot;
+			if (activePokemon) {
+				// Direct object reference check
+				let activeIdx = psSide.pokemon.indexOf(activePokemon);
+				
+				// If indexOf failed, try by position/slot property
+				if (activeIdx < 0) {
+					// In PS, each pokemon has a 'position' property (0-based index in team)
+					const pos = activePokemon.position;
+					if (typeof pos === 'number' && pos >= 0 && pos < psSide.pokemon.length) {
+						activeIdx = pos;
+					}
+				}
+				
+				// Final fallback - compare by species/name
+				if (activeIdx < 0) {
+					activeIdx = psSide.pokemon.findIndex((p: any) => 
+						p && (p.speciesState?.id === activePokemon.speciesState?.id || 
+						      p.species === activePokemon.species ||
+						      p.name === activePokemon.name)
+					);
+				}
+				
+				if (activeIdx >= 0) {
+					console.log(`[SyncPSEngine] Side ${sideIdx} active: ${activePokemon.name || activePokemon.species}, index ${activeIdx} (was ${player.activeIndex})`);
+					player.activeIndex = activeIdx;
+				} else {
+					console.warn(`[SyncPSEngine] Could not find active pokemon for side ${sideIdx}`);
+				}
 			}
 
 			// Update each pokemon
