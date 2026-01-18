@@ -484,60 +484,90 @@ function emitMovePrompts(room: Room, state: BattleState) {
     const active = player.team[player.activeIndex];
     if (!active || active.currentHP <= 0) continue;
     
-    // Try to get the actual request from PS engine (has real PP values)
+    // Get the PS engine's native request - this has the correct pokemon array ordering
+    // PS reorders the pokemon array after switches so active is always at index 0
     let psRequest: any = null;
     if (room.engine instanceof SyncPSEngine) {
       psRequest = room.engine.getRequest(player.id);
     }
     
-    // Get moves from PS request if available (has accurate PP)
+    const sideIndex = state.players.indexOf(player);
+    const sideId = `p${sideIndex + 1}`;
+    
+    // If we have a PS request, use it directly - it has correct array ordering and PP
+    if (psRequest && psRequest.side) {
+      // PS request already has the correct format, just add our extra fields
+      const moveRequest = {
+        ...psRequest,
+        requestType: psRequest.requestType || 'move',
+        playerId: player.id,
+        rqid: psRequest.rqid || Date.now(),
+        // Ensure side has our player ID for reference
+        side: {
+          ...psRequest.side,
+          playerId: player.id,
+        },
+      };
+      
+      sock.emit("promptAction", {
+        roomId: room.id,
+        playerId: player.id,
+        prompt: moveRequest,
+        state: state,
+      });
+      continue;
+    }
+    
+    // Fallback: Build request manually if PS request not available
+    // Note: This won't have the correct pokemon ordering after switches
     const psActiveMoves = psRequest?.active?.[0]?.moves || [];
     
-    // Build the move request similar to PS format
     const moveRequest = {
       requestType: 'move' as const,
-      side: player.id,
+      side: {
+        id: sideId,
+        name: player.name || player.id,
+        playerId: player.id,
+        pokemon: player.team.map((p: any, idx: number) => ({
+          id: p.id,
+          pokemonId: p.id,
+          ident: `${sideId}: ${p.name}`,
+          details: `${p.species}, L${p.level}`,
+          condition: p.currentHP <= 0 ? '0 fnt' : `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+          active: idx === player.activeIndex,
+          stats: p.stats,
+          moves: (p.moves || []).map((m: any) => typeof m === 'string' ? m : m.id || m.name),
+          baseAbility: p.ability,
+          item: p.item || '',
+          pokeball: 'pokeball',
+          ability: p.ability,
+          fainted: p.currentHP <= 0,
+        })),
+      },
       playerId: player.id,
-      rqid: Date.now(), // Add request ID for client tracking
+      rqid: Date.now(),
       active: [{
-        id: active.id,
-        pokemonId: active.id,
         moves: (active.moves || []).map((move: any, idx: number) => {
           const moveId = typeof move === 'string' ? move : move.id || move.name || `move${idx}`;
-          // Find corresponding PS move for accurate PP
           const psMove = psActiveMoves.find((m: any) => m.id === moveId || m.id === moveId.toLowerCase().replace(/\s/g, ''));
           
           return {
-            id: moveId,
-            name: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
-            // Use PS move PP if available, otherwise fallback
+            move: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
+            id: moveId.toLowerCase().replace(/\s/g, ''),
             pp: psMove?.pp ?? ((active as any).volatile?.pp?.[moveId] ?? move.pp ?? 10),
             maxpp: psMove?.maxpp ?? move.maxpp ?? move.pp ?? 10,
             target: psMove?.target || move.target || 'normal',
             disabled: psMove?.disabled || move.disabled || false,
           };
         }),
-        canSwitch: player.team.filter((p: any, i: number) => i !== player.activeIndex && p.currentHP > 0).length > 0,
       }],
-      pokemon: player.team.map((p: any, idx: number) => ({
-        id: p.id,
-        pokemonId: p.id,
-        ident: `p${state.players.indexOf(player) + 1}: ${p.name}`,
-        details: `${p.species}, L${p.level}`,
-        condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
-        active: idx === player.activeIndex,
-        stats: p.stats,
-        moves: p.moves,
-        item: p.item,
-        ability: p.ability,
-      })),
     };
     
     sock.emit("promptAction", {
       roomId: room.id,
       playerId: player.id,
       prompt: moveRequest,
-      state: state, // Include full battle state so client always has it
+      state: state,
     });
   }
 }
@@ -553,27 +583,59 @@ function emitForceSwitchPrompts(room: Room, state: BattleState, needsSwitch: str
     const player = state.players.find(p => p.id === playerId);
     if (!player) continue;
     
-    const sideIndex = state.players.indexOf(player);
+    // Get the PS engine's native request - it has correctly ordered pokemon array
+    let psRequest: any = null;
+    if (room.engine instanceof SyncPSEngine) {
+      psRequest = room.engine.getRequest(playerId);
+    }
     
+    const sideIndex = state.players.indexOf(player);
+    const sideId = `p${sideIndex + 1}`;
+    
+    // If we have a PS request with forceSwitch, use it directly
+    if (psRequest && psRequest.forceSwitch && psRequest.side) {
+      const switchRequest = {
+        ...psRequest,
+        playerId: player.id,
+        side: {
+          ...psRequest.side,
+          playerId: player.id,
+        },
+      };
+      
+      sock.emit("promptAction", {
+        roomId: room.id,
+        playerId: player.id,
+        prompt: switchRequest,
+        state: state,
+      });
+      continue;
+    }
+    
+    // Fallback: Build request manually if PS request not available
     const switchRequest = {
       forceSwitch: [true], // Single slot
       side: {
-        id: `p${sideIndex + 1}`,
+        id: sideId,
         name: player.name,
+        playerId: player.id,
         pokemon: player.team.map((p: any, idx: number) => ({
           id: p.id,
           pokemonId: p.id,
-          ident: `p${sideIndex + 1}: ${p.name}`,
+          ident: `${sideId}: ${p.name}`,
           details: `${p.species}, L${p.level}`,
-          condition: `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+          condition: p.currentHP <= 0 ? '0 fnt' : `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
           active: idx === player.activeIndex,
           stats: p.stats,
-          moves: p.moves,
-          item: p.item,
+          moves: (p.moves || []).map((m: any) => typeof m === 'string' ? m : m.id || m.name),
+          baseAbility: p.ability,
+          item: p.item || '',
+          pokeball: 'pokeball',
           ability: p.ability,
           fainted: p.currentHP <= 0,
         })),
       },
+      playerId: player.id,
     };
     
     sock.emit("promptAction", {

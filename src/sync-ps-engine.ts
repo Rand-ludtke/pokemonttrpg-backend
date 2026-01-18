@@ -119,6 +119,9 @@ export class SyncPSEngine {
 		// Sync initial state
 		this.syncStateFromPS();
 
+		// Capture initial PS log entries (setup, switch-ins, turn start)
+		this.collectNewLogEntries();
+
 		return this.state;
 	}
 
