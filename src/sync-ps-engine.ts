@@ -427,10 +427,12 @@ export class SyncPSEngine {
 			const player = this.state.players[sideIdx];
 			if (!psSide || !player) continue;
 
-			// Find active index
-			const activePos = psSide.active[0]?.position;
-			if (typeof activePos === "number" && activePos >= 0) {
-				player.activeIndex = activePos;
+			// Find active index - PS client uses .slot, server uses .position
+			// Try both to be safe, prefer slot for client compatibility
+			const activePokemon = psSide.active[0];
+			const activeSlot = activePokemon?.slot ?? activePokemon?.position;
+			if (typeof activeSlot === "number" && activeSlot >= 0) {
+				player.activeIndex = activeSlot;
 			}
 
 			// Update each pokemon
