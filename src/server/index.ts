@@ -489,6 +489,11 @@ function emitMovePrompts(room: Room, state: BattleState) {
     let psRequest: any = null;
     if (room.engine instanceof SyncPSEngine) {
       psRequest = room.engine.getRequest(player.id);
+      // Debug: Log PP values from PS request
+      if (psRequest?.active?.[0]?.moves) {
+        console.log(`[Server] PP from PS request for ${player.id}:`, 
+          psRequest.active[0].moves.map((m: any) => `${m.id || m.move}: ${m.pp}/${m.maxpp}`).join(', '));
+      }
     }
     
     const sideIndex = state.players.indexOf(player);

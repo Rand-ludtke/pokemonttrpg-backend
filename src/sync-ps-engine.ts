@@ -253,11 +253,19 @@ export class SyncPSEngine {
 		const log = this.battle.log || [];
 		const newEntries: string[] = [];
 		
+		// Debug: Log the full PS log and what we already have
+		console.log(`[SyncPSEngine] collectNewLogEntries - PS log has ${log.length} entries, state.log has ${this.state.log.length}`);
+		
 		for (const entry of log) {
 			if (!this.state.log.includes(entry)) {
 				this.state.log.push(entry);
 				newEntries.push(entry);
 			}
+		}
+		
+		// Debug: Log what we collected
+		if (newEntries.length > 0) {
+			console.log(`[SyncPSEngine] Collected ${newEntries.length} new entries:`, newEntries.slice(0, 10));
 		}
 		
 		return newEntries;
