@@ -494,7 +494,12 @@ export class PSEngine {
 			// Find move index (1-based)
 			const moveIndex = this.findMoveIndex(moveAction.moveId, request || null);
 			if (moveIndex > 0) {
-				return `move ${moveIndex}`;
+				let choice = `move ${moveIndex}`;
+				if (moveAction.mega) choice += " mega";
+				if (moveAction.zmove) choice += " zmove";
+				if (moveAction.dynamax) choice += " dynamax";
+				if (moveAction.terastallize) choice += " terastallize";
+				return choice;
 			}
 			// Fallback to move 1
 			return "move 1";

@@ -123,6 +123,10 @@ export interface MoveAction extends ActionBase {
 	moveId: string;
 	targetPlayerId: string; // simple single-target for now
 	targetPokemonId: string;
+	mega?: boolean;
+	zmove?: boolean;
+	dynamax?: boolean;
+	terastallize?: boolean;
 }
 
 export interface SwitchAction extends ActionBase {

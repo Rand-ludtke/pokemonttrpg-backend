@@ -961,6 +961,10 @@ io.on("connection", (socket: Socket) => {
             moveId: moveId,
             targetPlayerId: opponent?.id || "",
             targetPokemonId: opponentActive?.id || "",
+            mega: !!(data.action as any).mega,
+            zmove: !!(data.action as any).zmove,
+            dynamax: !!(data.action as any).dynamax,
+            terastallize: !!(data.action as any).terastallize,
           } as MoveAction;
           console.log(`[Server] Converted moveIndex ${moveIndex} to moveId ${moveId}`);
         }

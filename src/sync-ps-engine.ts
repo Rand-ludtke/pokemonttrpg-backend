@@ -382,7 +382,12 @@ export class SyncPSEngine {
 		if (action.type === "move") {
 			const moveAction = action as MoveAction;
 			const moveIndex = this.findMoveIndex(moveAction.moveId, side);
-			return `move ${moveIndex}`;
+			let choice = `move ${moveIndex}`;
+			if (moveAction.mega) choice += " mega";
+			if (moveAction.zmove) choice += " zmove";
+			if (moveAction.dynamax) choice += " dynamax";
+			if (moveAction.terastallize) choice += " terastallize";
+			return choice;
 		}
 
 		if (action.type === "switch") {
