@@ -319,14 +319,19 @@ function emitChallengeRemoved(room: Room, challengeId: string, reason: string) {
 }
 
 function coerceTrainerSprite(value: unknown): string | undefined {
+  let raw: string | undefined;
   if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
+    raw = value.trim();
+  } else if (typeof value === "number" && Number.isFinite(value)) {
+    raw = String(Math.trunc(value));
   }
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return String(Math.trunc(value));
-  }
-  return undefined;
+  if (!raw) return undefined;
+  // Normalize: lowercase, remove spaces/special chars
+  const normalized = raw.toLowerCase().replace(/[\s_-]+/g, "").replace(/[^a-z0-9]/gi, "");
+  // Filter out invalid/placeholder values
+  const invalid = ["mirror", "pending", "random", "default", "unknown", "none", ""];
+  if (invalid.includes(normalized)) return undefined;
+  return raw;
 }
 
 function sanitizePlayerPayload(player: Player, participant: ChallengeParticipant): Player {
@@ -338,10 +343,9 @@ function sanitizePlayerPayload(player: Player, participant: ChallengeParticipant
   clone.id = participant.playerId;
   clone.name = clone.name || participant.username;
   if (typeof clone.activeIndex !== "number") clone.activeIndex = 0;
-  if (trainerSprite) {
-    cloneAny.trainerSprite = trainerSprite;
-    cloneAny.avatar = trainerSprite;
-  }
+  // Always set/clear trainerSprite and avatar to ensure invalid values like "mirror" are removed
+  cloneAny.trainerSprite = trainerSprite || undefined;
+  cloneAny.avatar = trainerSprite || undefined;
   return clone;
 }
 
@@ -488,10 +492,9 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
     const clone = JSON.parse(JSON.stringify(player)) as Player;
     const roomPlayer = room.players.find((p) => p.id === player.id);
     const trainerSprite = coerceTrainerSprite((clone as any).trainerSprite ?? (clone as any).avatar ?? roomPlayer?.trainerSprite);
-    if (trainerSprite) {
-      (clone as any).trainerSprite = trainerSprite;
-      (clone as any).avatar = trainerSprite;
-    }
+    // Always set/clear trainerSprite and avatar to ensure invalid values like "mirror" are removed
+    (clone as any).trainerSprite = trainerSprite || undefined;
+    (clone as any).avatar = trainerSprite || undefined;
     return clone;
   });
 

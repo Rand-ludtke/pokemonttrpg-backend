@@ -89,12 +89,16 @@ export class SyncPSEngine {
 		const p1Team = this.convertTeamToPacked(players[0].team);
 		const p2Team = this.convertTeamToPacked(players[1].team);
 
+		// Extract avatar/trainerSprite for PS protocol
+		const p1Avatar = (players[0] as any).trainerSprite || (players[0] as any).avatar || "";
+		const p2Avatar = (players[1] as any).trainerSprite || (players[1] as any).avatar || "";
+
 		// Create the battle directly (synchronous)
 		this.battle = new PSBattle({
 			formatid: this.format as any,
 			seed: seedArray,
-			p1: { name: players[0].name, team: p1Team },
-			p2: { name: players[1].name, team: p2Team },
+			p1: { name: players[0].name, avatar: p1Avatar, team: p1Team },
+			p2: { name: players[1].name, avatar: p2Avatar, team: p2Team },
 		});
 
 		// Initialize our state mirror
