@@ -26,6 +26,7 @@ if (!fs.existsSync(REPLAYS_DIR)) fs.mkdirSync(REPLAYS_DIR);
 export interface ClientInfo {
   id: string;
   username: string;
+  trainerSprite?: string;
 }
 
 // Union type for either engine
@@ -34,8 +35,8 @@ type BattleEngine = Engine | SyncPSEngine;
 export interface Room {
   id: string;
   name: string;
-  players: { id: string; username: string; socketId: string }[];
-  spectators: { id: string; username: string; socketId: string }[];
+  players: { id: string; username: string; socketId: string; trainerSprite?: string }[];
+  spectators: { id: string; username: string; socketId: string; trainerSprite?: string }[];
   engine?: BattleEngine;
   battleStarted: boolean;
   turnBuffer: Record<string, Action>; // keyed by player id
@@ -58,6 +59,7 @@ interface ChallengeParticipant {
   username: string;
   socketId: string;
   accepted: boolean;
+  trainerSprite?: string;
   playerPayload?: Player;
 }
 
@@ -316,11 +318,30 @@ function emitChallengeRemoved(room: Room, challengeId: string, reason: string) {
   io.to(room.id).emit("challengeRemoved", { roomId: room.id, challengeId, reason });
 }
 
+function coerceTrainerSprite(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(Math.trunc(value));
+  }
+  return undefined;
+}
+
 function sanitizePlayerPayload(player: Player, participant: ChallengeParticipant): Player {
   const clone = JSON.parse(JSON.stringify(player)) as Player;
+  const cloneAny = clone as any;
+  const trainerSprite = coerceTrainerSprite(
+    cloneAny.trainerSprite ?? cloneAny.avatar ?? participant.trainerSprite
+  );
   clone.id = participant.playerId;
   clone.name = clone.name || participant.username;
   if (typeof clone.activeIndex !== "number") clone.activeIndex = 0;
+  if (trainerSprite) {
+    cloneAny.trainerSprite = trainerSprite;
+    cloneAny.avatar = trainerSprite;
+  }
   return clone;
 }
 
@@ -376,6 +397,8 @@ function startTeamPreview(room: Room, players: Player[], rules?: any) {
         players: players.map((p, pIdx) => ({
           id: p.id,
           name: p.name || p.id,
+          trainerSprite: (p as any).trainerSprite,
+          avatar: (p as any).avatar ?? (p as any).trainerSprite,
           activeIndex: 0,
           team: p.team.map((mon: any) => ({
             id: mon.id,
@@ -461,7 +484,18 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   room.turnBuffer = {};
   room.replay = [];
   clearForceSwitchTimer(room);
-  const state = room.engine.initializeBattle(players, { seed: battleSeed });
+  const hydratedPlayers = players.map((player) => {
+    const clone = JSON.parse(JSON.stringify(player)) as Player;
+    const roomPlayer = room.players.find((p) => p.id === player.id);
+    const trainerSprite = coerceTrainerSprite((clone as any).trainerSprite ?? (clone as any).avatar ?? roomPlayer?.trainerSprite);
+    if (trainerSprite) {
+      (clone as any).trainerSprite = trainerSprite;
+      (clone as any).avatar = trainerSprite;
+    }
+    return clone;
+  });
+
+  const state = room.engine.initializeBattle(hydratedPlayers, { seed: battleSeed });
   room.battleStarted = true;
   room.phase = "normal";
   room.forceSwitchNeeded = new Set();
@@ -682,8 +716,14 @@ function launchChallenge(sourceRoom: Room, challenge: Challenge) {
   ownerSocket.join(battleRoomId);
   targetSocket.join(battleRoomId);
 
-  battleRoom.players.push({ id: challenge.owner.playerId, username: challenge.owner.username, socketId: challenge.owner.socketId });
-  battleRoom.players.push({ id: challenge.target.playerId, username: challenge.target.username, socketId: challenge.target.socketId });
+  const ownerTrainerSprite = coerceTrainerSprite(
+    (challenge.owner.playerPayload as any)?.trainerSprite ?? (challenge.owner.playerPayload as any)?.avatar ?? challenge.owner.trainerSprite
+  );
+  const targetTrainerSprite = coerceTrainerSprite(
+    (challenge.target.playerPayload as any)?.trainerSprite ?? (challenge.target.playerPayload as any)?.avatar ?? challenge.target.trainerSprite
+  );
+  battleRoom.players.push({ id: challenge.owner.playerId, username: challenge.owner.username, socketId: challenge.owner.socketId, trainerSprite: ownerTrainerSprite });
+  battleRoom.players.push({ id: challenge.target.playerId, username: challenge.target.username, socketId: challenge.target.socketId, trainerSprite: targetTrainerSprite });
 
   const playersPayload = [
     sanitizePlayerPayload(challenge.owner.playerPayload, challenge.owner),
@@ -789,9 +829,31 @@ function clearForceSwitchTimer(room: Room) {
 io.on("connection", (socket: Socket) => {
   let user: ClientInfo = { id: socket.id, username: `Guest-${socket.id.slice(0, 4)}` };
 
-  socket.on("identify", (data: { username?: string }) => {
+  socket.on("identify", (data: { username?: string; trainerSprite?: string; avatar?: string }) => {
     if (data?.username) user.username = data.username;
-    socket.emit("identified", { id: user.id, username: user.username });
+    const nextTrainerSprite = coerceTrainerSprite(data?.trainerSprite ?? data?.avatar);
+    if (nextTrainerSprite) user.trainerSprite = nextTrainerSprite;
+    const touchedRooms: Room[] = [];
+    for (const room of rooms.values()) {
+      let touched = false;
+      const player = room.players.find((p) => p.socketId === socket.id);
+      if (player) {
+        player.username = user.username;
+        if (user.trainerSprite) player.trainerSprite = user.trainerSprite;
+        touched = true;
+      }
+      const spectator = room.spectators.find((s) => s.socketId === socket.id);
+      if (spectator) {
+        spectator.username = user.username;
+        if (user.trainerSprite) spectator.trainerSprite = user.trainerSprite;
+        touched = true;
+      }
+      if (touched) touchedRooms.push(room);
+    }
+    socket.emit("identified", { id: user.id, username: user.username, trainerSprite: user.trainerSprite, avatar: user.trainerSprite });
+    for (const room of touchedRooms) {
+      broadcastRoomSummary(room);
+    }
   });
 
   socket.on("createRoom", (data: { name?: string; id?: string }) => {
@@ -809,9 +871,9 @@ io.on("connection", (socket: Socket) => {
     if (!room) return socket.emit("error", { error: "room not found" });
     socket.join(room.id);
     if (data.role === "player") {
-      room.players.push({ id: user.id, username: user.username, socketId: socket.id });
+      room.players.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
     } else {
-      room.spectators.push({ id: user.id, username: user.username, socketId: socket.id });
+      room.spectators.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
       // Send spectator snapshot if battle started
       if (room.battleStarted && room.engine) {
   const state = room.engine.getState();
@@ -1051,6 +1113,13 @@ io.on("connection", (socket: Socket) => {
     const challengeId = rawId && !room.challenges.has(rawId) ? rawId : uuidv4().slice(0, 8);
     const targetPlayer = data?.toPlayerId ? room.players.find((p) => p.id === data.toPlayerId) : undefined;
 
+    const ownerPayload = data?.player ? JSON.parse(JSON.stringify(data.player)) : undefined;
+    const ownerTrainerSprite = coerceTrainerSprite((ownerPayload as any)?.trainerSprite ?? (ownerPayload as any)?.avatar ?? user.trainerSprite);
+    if (ownerPayload && ownerTrainerSprite) {
+      (ownerPayload as any).trainerSprite = ownerTrainerSprite;
+      (ownerPayload as any).avatar = ownerTrainerSprite;
+    }
+
     const challenge: Challenge = {
       id: challengeId,
       roomId: room.id,
@@ -1063,7 +1132,8 @@ io.on("connection", (socket: Socket) => {
         username: user.username,
         socketId: socket.id,
         accepted: true,
-        playerPayload: data?.player ? JSON.parse(JSON.stringify(data.player)) : undefined,
+        trainerSprite: ownerTrainerSprite,
+        playerPayload: ownerPayload,
       },
       target: targetPlayer
         ? {
@@ -1125,9 +1195,16 @@ io.on("connection", (socket: Socket) => {
 
     if (!data?.player) return socket.emit("error", { error: "team payload required" });
 
+    const participantPayload = JSON.parse(JSON.stringify(data.player));
+    const participantTrainerSprite = coerceTrainerSprite((participantPayload as any)?.trainerSprite ?? (participantPayload as any)?.avatar ?? user.trainerSprite);
+    if (participantTrainerSprite) {
+      (participantPayload as any).trainerSprite = participantTrainerSprite;
+      (participantPayload as any).avatar = participantTrainerSprite;
+    }
     participant.accepted = true;
     participant.username = user.username;
-    participant.playerPayload = JSON.parse(JSON.stringify(data.player));
+    participant.trainerSprite = participantTrainerSprite;
+    participant.playerPayload = participantPayload;
 
     if (challenge.owner.accepted && challenge.owner.playerPayload && challenge.target && challenge.target.accepted && challenge.target.playerPayload) {
       challenge.status = "launching";
@@ -1171,7 +1248,7 @@ function summary(room: Room) {
   return {
     id: room.id,
     name: room.name,
-    players: room.players.map((p) => ({ id: p.id, username: p.username })),
+    players: room.players.map((p) => ({ id: p.id, username: p.username, trainerSprite: p.trainerSprite, avatar: p.trainerSprite })),
     spectCount: room.spectators.length,
     battleStarted: room.battleStarted,
     challengeCount: room.challenges.size,
