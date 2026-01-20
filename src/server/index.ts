@@ -939,26 +939,27 @@ io.on("connection", (socket: Socket) => {
     }
     
     // Convert moveIndex-based action to moveId-based action
-    // Client sends { type: 'move', moveIndex: 0 }, we need to convert to { type: 'move', moveId: '...', pokemonId: '...', ... }
+    // Client may send { type: 'move', moveId: '...', moveIndex: 0 }
     let processedAction = data.action;
-    if (data.action.type === "move" && typeof (data.action as any).moveIndex === "number") {
+    if (data.action.type === "move") {
       const moveState = room.engine.getState();
       const movePlayer = moveState.players.find(p => p.id === data.playerId);
       if (movePlayer) {
         const activePokemon = movePlayer.team[movePlayer.activeIndex];
-        const moveIndex = (data.action as any).moveIndex;
-        const move = activePokemon?.moves?.[moveIndex];
-        if (move) {
-          const moveId = typeof move === 'string' ? move : (move.id || move.name);
-          // Find opponent for target
-          const opponent = moveState.players.find(p => p.id !== data.playerId);
-          const opponentActive = opponent?.team[opponent.activeIndex];
-          
+        const opponent = moveState.players.find(p => p.id !== data.playerId);
+        const opponentActive = opponent?.team[opponent.activeIndex];
+
+        const providedMoveId = (data.action as any).moveId as string | undefined;
+        const moveIndex = (data.action as any).moveIndex as number | undefined;
+        const moveFromIndex = typeof moveIndex === "number" ? activePokemon?.moves?.[moveIndex] : undefined;
+        const resolvedMoveId = providedMoveId || (moveFromIndex ? (typeof moveFromIndex === 'string' ? moveFromIndex : (moveFromIndex.id || moveFromIndex.name)) : undefined);
+
+        if (resolvedMoveId) {
           processedAction = {
             type: "move",
             actorPlayerId: data.playerId,
             pokemonId: activePokemon.id,
-            moveId: moveId,
+            moveId: resolvedMoveId,
             targetPlayerId: opponent?.id || "",
             targetPokemonId: opponentActive?.id || "",
             mega: !!(data.action as any).mega,
@@ -966,7 +967,11 @@ io.on("connection", (socket: Socket) => {
             dynamax: !!(data.action as any).dynamax,
             terastallize: !!(data.action as any).terastallize,
           } as MoveAction;
-          console.log(`[Server] Converted moveIndex ${moveIndex} to moveId ${moveId}`);
+          if (typeof moveIndex === "number") {
+            console.log(`[Server] Converted moveIndex ${moveIndex} to moveId ${resolvedMoveId}`);
+          } else {
+            console.log(`[Server] Using provided moveId ${resolvedMoveId}`);
+          }
         }
       }
     }
