@@ -504,6 +504,15 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   room.forceSwitchNeeded = new Set();
   console.log(`[Server] Emitting battleStarted for room ${room.id}`);
   io.to(room.id).emit("battleStarted", { roomId: room.id, state });
+
+  // Emit initial protocol events (|start|, |switch|, |turn|1) before prompting for moves
+  const initialEvents = Array.isArray(state?.log) ? state.log : [];
+  if (initialEvents.length > 0) {
+    io.to(room.id).emit("battleUpdate", {
+      result: { state, events: initialEvents, anim: [] },
+      needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
+    });
+  }
   
   // Emit move prompts to each player so they can choose their first action
   emitMovePrompts(room, state);
