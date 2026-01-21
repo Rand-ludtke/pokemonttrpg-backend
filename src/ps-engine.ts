@@ -110,6 +110,11 @@ export class PSEngine {
 		const p1Team = this.convertTeamToPacked(players[0].team);
 		const p2Team = this.convertTeamToPacked(players[1].team);
 
+		// Extract avatar/trainerSprite for PS protocol
+		// IMPORTANT: Default to 'acetrainer' not empty string - PS client calls rollTrainerSprites() if avatar is falsy
+		const p1Avatar = (players[0] as any).trainerSprite || (players[0] as any).avatar || "acetrainer";
+		const p2Avatar = (players[1] as any).trainerSprite || (players[1] as any).avatar || "acetrainer";
+
 		this.battle = {
 			stream,
 			omniscient,
@@ -150,8 +155,8 @@ export class PSEngine {
 		// Start the battle
 		const spec = { formatid: format, seed };
 		await omniscient.write(`>start ${JSON.stringify(spec)}`);
-		await omniscient.write(`>player p1 ${JSON.stringify({ name: players[0].name, team: p1Team })}`);
-		await omniscient.write(`>player p2 ${JSON.stringify({ name: players[1].name, team: p2Team })}`);
+		await omniscient.write(`>player p1 ${JSON.stringify({ name: players[0].name, avatar: p1Avatar, team: p1Team })}`);
+		await omniscient.write(`>player p2 ${JSON.stringify({ name: players[1].name, avatar: p2Avatar, team: p2Team })}`);
 
 		// Wait for initial requests
 		await this.waitForRequests();

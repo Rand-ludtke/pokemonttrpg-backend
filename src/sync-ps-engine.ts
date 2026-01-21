@@ -90,8 +90,9 @@ export class SyncPSEngine {
 		const p2Team = this.convertTeamToPacked(players[1].team);
 
 		// Extract avatar/trainerSprite for PS protocol
-		const p1Avatar = (players[0] as any).trainerSprite || (players[0] as any).avatar || "";
-		const p2Avatar = (players[1] as any).trainerSprite || (players[1] as any).avatar || "";
+		// IMPORTANT: Default to 'acetrainer' not empty string - PS client calls rollTrainerSprites() if avatar is falsy
+		const p1Avatar = (players[0] as any).trainerSprite || (players[0] as any).avatar || "acetrainer";
+		const p2Avatar = (players[1] as any).trainerSprite || (players[1] as any).avatar || "acetrainer";
 
 		// Create the battle directly (synchronous)
 		this.battle = new PSBattle({

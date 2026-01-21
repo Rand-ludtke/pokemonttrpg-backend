@@ -329,7 +329,7 @@ function coerceTrainerSprite(value: unknown): string | undefined {
   // Normalize: lowercase, remove spaces/special chars
   const normalized = raw.toLowerCase().replace(/[\s_-]+/g, "").replace(/[^a-z0-9]/gi, "");
   // Filter out invalid/placeholder values
-  const invalid = ["mirror", "pending", "random", "default", "unknown", "none", ""];
+  const invalid = ["pending", "random", "default", "unknown", "none", ""];
   if (invalid.includes(normalized)) return undefined;
   return raw;
 }
@@ -343,7 +343,7 @@ function sanitizePlayerPayload(player: Player, participant: ChallengeParticipant
   clone.id = participant.playerId;
   clone.name = clone.name || participant.username;
   if (typeof clone.activeIndex !== "number") clone.activeIndex = 0;
-  // Always set/clear trainerSprite and avatar to ensure invalid values like "mirror" are removed
+  // Always set/clear trainerSprite and avatar to ensure invalid values are removed
   cloneAny.trainerSprite = trainerSprite || undefined;
   cloneAny.avatar = trainerSprite || undefined;
   return clone;
@@ -474,7 +474,7 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
     return;
   }
   
-  const battleSeed = seed ?? 123;
+  const battleSeed = Number.isFinite(seed as number) ? (seed as number) : undefined;
   
   // Use Pokemon Showdown engine or custom engine based on configuration
   if (USE_PS_ENGINE) {
@@ -492,7 +492,7 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
     const clone = JSON.parse(JSON.stringify(player)) as Player;
     const roomPlayer = room.players.find((p) => p.id === player.id);
     const trainerSprite = coerceTrainerSprite((clone as any).trainerSprite ?? (clone as any).avatar ?? roomPlayer?.trainerSprite);
-    // Always set/clear trainerSprite and avatar to ensure invalid values like "mirror" are removed
+    // Always set/clear trainerSprite and avatar to ensure invalid values are removed
     (clone as any).trainerSprite = trainerSprite || undefined;
     (clone as any).avatar = trainerSprite || undefined;
     return clone;
@@ -892,14 +892,23 @@ io.on("connection", (socket: Socket) => {
     if (!room) return socket.emit("error", { error: "room not found" });
     if (room.battleStarted) return;
     
-    const battleSeed = data.seed ?? 123;
+    const battleSeed = Number.isFinite(data.seed as number) ? (data.seed as number) : undefined;
     if (USE_PS_ENGINE) {
       room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed });
     } else {
       room.engine = new Engine({ seed: battleSeed });
     }
+
+    const hydratedPlayers = data.players.map((player) => {
+      const clone = JSON.parse(JSON.stringify(player)) as Player;
+      const roomPlayer = room.players.find((p) => p.id === player.id);
+      const trainerSprite = coerceTrainerSprite((clone as any).trainerSprite ?? (clone as any).avatar ?? roomPlayer?.trainerSprite);
+      (clone as any).trainerSprite = trainerSprite || undefined;
+      (clone as any).avatar = trainerSprite || undefined;
+      return clone;
+    });
     
-    const state = room.engine.initializeBattle(data.players, { seed: battleSeed });
+    const state = room.engine.initializeBattle(hydratedPlayers, { seed: battleSeed });
     room.battleStarted = true;
     room.phase = "normal";
     room.forceSwitchNeeded = new Set();
