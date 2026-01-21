@@ -506,8 +506,15 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   io.to(room.id).emit("battleStarted", { roomId: room.id, state });
 
   // Emit initial protocol events (|start|, |switch|, |turn|1) before prompting for moves
-  const initialEvents = Array.isArray(state?.log) ? state.log : [];
+  // This prevents a pre-start move prompt from showing before the battle is visually started.
+  const initialEvents = buildInitialBattleProtocol(state);
   if (initialEvents.length > 0) {
+    // Append to state.log so SyncPSEngine won't re-send these lines later
+    if (Array.isArray(state.log)) {
+      for (const line of initialEvents) {
+        if (!state.log.includes(line)) state.log.push(line);
+      }
+    }
     io.to(room.id).emit("battleUpdate", {
       result: { state, events: initialEvents, anim: [] },
       needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
@@ -516,6 +523,29 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   
   // Emit move prompts to each player so they can choose their first action
   emitMovePrompts(room, state);
+}
+
+function buildInitialBattleProtocol(state: BattleState): string[] {
+  if (!state?.players?.length) return [];
+  const lines: string[] = [];
+  lines.push("|start");
+  state.players.forEach((player: any, idx: number) => {
+    const side = `p${idx + 1}`;
+    const activeIndex = player.activeIndex || 0;
+    const activePoke = player.team?.[activeIndex];
+    if (!activePoke) return;
+    const nickname = activePoke.nickname || activePoke.name;
+    const species = activePoke.species || activePoke.name;
+    const level = activePoke.level || 100;
+    const gender = activePoke.gender === "M" ? ", M" : (activePoke.gender === "F" ? ", F" : "");
+    const hp = activePoke.currentHP ?? activePoke.maxHP ?? 100;
+    const maxHP = activePoke.maxHP ?? 100;
+    const details = `${species}, L${level}${gender}`;
+    lines.push(`|switch|${side}a: ${nickname}|${details}|${hp}/${maxHP}`);
+  });
+  const turn = state.turn || 1;
+  lines.push(`|turn|${turn}`);
+  return lines;
 }
 
 // Emit move prompts to all players in a battle
