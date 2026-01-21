@@ -499,6 +499,10 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   });
 
   const state = room.engine.initializeBattle(hydratedPlayers, { seed: battleSeed });
+  // Ensure clients treat this as turn 1 when prompting (no pre-start move UI)
+  if (typeof state.turn === "number" && state.turn < 1) {
+    state.turn = 1;
+  }
   room.battleStarted = true;
   room.phase = "normal";
   room.forceSwitchNeeded = new Set();
@@ -948,11 +952,27 @@ io.on("connection", (socket: Socket) => {
     });
     
     const state = room.engine.initializeBattle(hydratedPlayers, { seed: battleSeed });
+    if (typeof state.turn === "number" && state.turn < 1) {
+      state.turn = 1;
+    }
     room.battleStarted = true;
     room.phase = "normal";
     room.forceSwitchNeeded = new Set();
     console.log(`[Server] Emitting battleStarted for room ${room.id} (startBattle socket)`);
     io.to(room.id).emit("battleStarted", { roomId: room.id, state });
+    const initialEvents = buildInitialBattleProtocol(state);
+    if (initialEvents.length > 0) {
+      if (Array.isArray(state.log)) {
+        for (const line of initialEvents) {
+          if (!state.log.includes(line)) state.log.push(line);
+        }
+      }
+      io.to(room.id).emit("battleUpdate", {
+        result: { state, events: initialEvents, anim: [] },
+        needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
+      });
+    }
+    emitMovePrompts(room, state);
   });
 
   socket.on("sendAction", (data: { roomId: string; playerId: string; action: Action }) => {
