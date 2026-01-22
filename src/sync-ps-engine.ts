@@ -498,18 +498,40 @@ export class SyncPSEngine {
 					ourMon.currentHP = 0;
 				}
 
-				// Update stages/boosts
-				if (psMon.boosts) {
+				// Update stages/boosts - check if this is the active pokemon
+				// In PS, boosts are on the active pokemon object (psSide.active[0])
+				// which may or may not be the same reference as psSide.pokemon[i]
+				const isActive = activePokemon && (
+					psMon === activePokemon || 
+					psMon.position === activePokemon.position ||
+					(psMon.speciesState?.id === activePokemon.speciesState?.id && psMon.name === activePokemon.name)
+				);
+				
+				// Get boosts from the appropriate source
+				const boostSource = isActive && activePokemon?.boosts ? activePokemon.boosts : psMon.boosts;
+				
+				if (boostSource) {
 					ourMon.stages = {
 						hp: 0,
-						atk: psMon.boosts.atk || 0,
-						def: psMon.boosts.def || 0,
-						spa: psMon.boosts.spa || 0,
-						spd: psMon.boosts.spd || 0,
-						spe: psMon.boosts.spe || 0,
-						acc: psMon.boosts.accuracy || 0,
-						eva: psMon.boosts.evasion || 0,
+						atk: boostSource.atk || 0,
+						def: boostSource.def || 0,
+						spa: boostSource.spa || 0,
+						spd: boostSource.spd || 0,
+						spe: boostSource.spe || 0,
+						acc: boostSource.accuracy || 0,
+						eva: boostSource.evasion || 0,
 					};
+					
+					// Debug logging for boost sync
+					if (isActive && (boostSource.atk || boostSource.def || boostSource.spa || boostSource.spd || boostSource.spe)) {
+						console.log(`[SyncPSEngine] Active pokemon ${ourMon.name} boosts synced:`, {
+							atk: boostSource.atk || 0,
+							def: boostSource.def || 0,
+							spa: boostSource.spa || 0,
+							spd: boostSource.spd || 0,
+							spe: boostSource.spe || 0,
+						});
+					}
 				}
 			}
 		}

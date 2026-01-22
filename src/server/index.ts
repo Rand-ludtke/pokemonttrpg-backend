@@ -409,11 +409,15 @@ function startTeamPreview(room: Room, players: Player[], rules?: any) {
           team: p.team.map((mon: any) => ({
             id: mon.id,
             pokemonId: mon.id,
-            name: mon.name || mon.species,
-            species: mon.species,
+            // Use mon.name as the species (in our type system, 'name' IS the species, 'nickname' is for display)
+            name: mon.nickname || mon.name || mon.species,
+            species: mon.species || mon.name, // Ensure species is always set
             nickname: mon.nickname,
             level: mon.level || 50,
             types: mon.types,
+            gender: mon.gender,
+            shiny: mon.shiny,
+            item: mon.item,
           })),
         })),
       },
@@ -1201,8 +1205,14 @@ io.on("connection", (socket: Socket) => {
         emitMovePrompts(room, result.state);
       }
     } else {
-      // prompt others that we're waiting
-      io.to(room.id).emit("promptAction", { waitingFor: expected - Object.keys(room.turnBuffer).length });
+      // Send "waiting" notification ONLY to the player who just submitted
+      // Not to all players - that would incorrectly put both in waiting state
+      socket.emit("promptAction", { 
+        roomId: data.roomId,
+        playerId: data.playerId,
+        waitingFor: expected - Object.keys(room.turnBuffer).length,
+        prompt: { wait: true }
+      });
     }
   });
 
