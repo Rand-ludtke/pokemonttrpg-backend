@@ -542,9 +542,10 @@ function buildInitialBattleProtocol(state: BattleState): string[] {
     const species = activePoke.species || activePoke.name;
     const level = activePoke.level || 100;
     const gender = activePoke.gender === "M" ? ", M" : (activePoke.gender === "F" ? ", F" : "");
+    const shiny = (activePoke as any).shiny ? ", shiny" : "";
     const hp = activePoke.currentHP ?? activePoke.maxHP ?? 100;
     const maxHP = activePoke.maxHP ?? 100;
-    const details = `${species}, L${level}${gender}`;
+    const details = `${species}, L${level}${gender}${shiny}`;
     lines.push(`|switch|${side}a: ${nickname}|${details}|${hp}/${maxHP}`);
   });
   const turn = state.turn || 1;
