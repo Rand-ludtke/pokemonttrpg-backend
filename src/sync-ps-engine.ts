@@ -66,6 +66,7 @@ export class SyncPSEngine {
 	private playerIdToSide: Map<string, "p1" | "p2"> = new Map();
 	private sideToPlayerId: Map<"p1" | "p2", string> = new Map();
 	private format: string;
+	private lastLogIndex = 0;
 
 	constructor(private readonly options?: { format?: string; seed?: number | number[] }) {
 		this.format = options?.format || "gen9customgame";
@@ -257,12 +258,19 @@ export class SyncPSEngine {
 		
 		const log = this.battle.log || [];
 		const newEntries: string[] = [];
-		
-		for (const entry of log) {
-			if (!this.state.log.includes(entry)) {
+
+		// If the battle log was reset, rewind our cursor.
+		if (this.lastLogIndex > log.length) {
+			this.lastLogIndex = 0;
+		}
+
+		if (log.length > this.lastLogIndex) {
+			const slice = log.slice(this.lastLogIndex);
+			for (const entry of slice) {
 				this.state.log.push(entry);
 				newEntries.push(entry);
 			}
+			this.lastLogIndex = log.length;
 		}
 		
 		return newEntries;
