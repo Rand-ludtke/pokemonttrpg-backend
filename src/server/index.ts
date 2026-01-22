@@ -46,6 +46,7 @@ export interface Room {
   forceSwitchTimer?: NodeJS.Timeout;
   forceSwitchDeadline?: number; // epoch ms
   challenges: Map<string, Challenge>;
+  lastPromptByPlayer?: Record<string, { turn: number; type: "move" | "wait" | "switch" | "team"; rqid?: number }>;
   // Team preview state
   teamPreviewPlayers?: Player[];
   teamPreviewOrders?: Record<string, number[]>;
@@ -108,6 +109,7 @@ function createRoomRecord(id: string, name: string): Room {
     forceSwitchTimer: undefined,
     forceSwitchDeadline: undefined,
     challenges: new Map(),
+    lastPromptByPlayer: {},
   };
 }
 
@@ -556,6 +558,8 @@ function buildInitialBattleProtocol(state: BattleState): string[] {
 // Emit move prompts to all players in a battle
 function emitMovePrompts(room: Room, state: BattleState) {
   if (!room.engine) return;
+  const turn = state.turn || 1;
+  if (!room.lastPromptByPlayer) room.lastPromptByPlayer = {};
   for (const player of state.players) {
     const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
     if (!playerSocket) continue;
@@ -564,6 +568,7 @@ function emitMovePrompts(room: Room, state: BattleState) {
     
     const active = player.team[player.activeIndex];
     if (!active || active.currentHP <= 0) continue;
+    const alreadyActed = !!room.turnBuffer[player.id];
     
     // Get the PS engine's native request - this has the correct pokemon array ordering
     // PS reorders the pokemon array after switches so active is always at index 0
@@ -578,24 +583,40 @@ function emitMovePrompts(room: Room, state: BattleState) {
     // If we have a PS request, use it directly - it has correct array ordering and PP
     if (psRequest && psRequest.side) {
       // PS request already has the correct format, just add our extra fields
-      const moveRequest = {
-        ...psRequest,
-        requestType: psRequest.requestType || 'move',
+      const baseSide = {
+        ...psRequest.side,
         playerId: player.id,
-        rqid: psRequest.rqid || Date.now(),
-        // Ensure side has our player ID for reference
-        side: {
-          ...psRequest.side,
-          playerId: player.id,
-        },
       };
+
+      const promptType: "move" | "wait" = alreadyActed ? "wait" : "move";
+      const lastPrompt = room.lastPromptByPlayer[player.id];
+      if (lastPrompt && lastPrompt.turn === turn && lastPrompt.type === promptType) {
+        continue;
+      }
+
+      const prompt = alreadyActed
+        ? { wait: true, side: baseSide, rqid: psRequest.rqid || Date.now() }
+        : {
+            ...psRequest,
+            requestType: psRequest.requestType || "move",
+            playerId: player.id,
+            rqid: psRequest.rqid || Date.now(),
+            // Ensure side has our player ID for reference
+            side: baseSide,
+          };
       
       sock.emit("promptAction", {
         roomId: room.id,
         playerId: player.id,
-        prompt: moveRequest,
+        prompt,
         state: state,
       });
+
+      room.lastPromptByPlayer[player.id] = {
+        turn,
+        type: promptType,
+        rqid: (prompt as any).rqid,
+      };
       continue;
     }
     
@@ -603,9 +624,7 @@ function emitMovePrompts(room: Room, state: BattleState) {
     // Note: This won't have the correct pokemon ordering after switches
     const psActiveMoves = psRequest?.active?.[0]?.moves || [];
     
-    const moveRequest = {
-      requestType: 'move' as const,
-      side: {
+    const sidePayload = {
         id: sideId,
         name: player.name || player.id,
         playerId: player.id,
@@ -624,32 +643,50 @@ function emitMovePrompts(room: Room, state: BattleState) {
           ability: p.ability,
           fainted: p.currentHP <= 0,
         })),
-      },
-      playerId: player.id,
-      rqid: Date.now(),
-      active: [{
-        moves: (active.moves || []).map((move: any, idx: number) => {
-          const moveId = typeof move === 'string' ? move : move.id || move.name || `move${idx}`;
-          const psMove = psActiveMoves.find((m: any) => m.id === moveId || m.id === moveId.toLowerCase().replace(/\s/g, ''));
-          
-          return {
-            move: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
-            id: moveId.toLowerCase().replace(/\s/g, ''),
-            pp: psMove?.pp ?? ((active as any).volatile?.pp?.[moveId] ?? move.pp ?? 10),
-            maxpp: psMove?.maxpp ?? move.maxpp ?? move.pp ?? 10,
-            target: psMove?.target || move.target || 'normal',
-            disabled: psMove?.disabled || move.disabled || false,
-          };
-        }),
-      }],
     };
+
+    const promptType: "move" | "wait" = alreadyActed ? "wait" : "move";
+    const lastPrompt = room.lastPromptByPlayer[player.id];
+    if (lastPrompt && lastPrompt.turn === turn && lastPrompt.type === promptType) {
+      continue;
+    }
+
+    const prompt = alreadyActed
+      ? { wait: true, side: sidePayload, rqid: Date.now() }
+      : {
+          requestType: "move" as const,
+          side: sidePayload,
+          playerId: player.id,
+          rqid: Date.now(),
+          active: [{
+            moves: (active.moves || []).map((move: any, idx: number) => {
+              const moveId = typeof move === "string" ? move : move.id || move.name || `move${idx}`;
+              const psMove = psActiveMoves.find((m: any) => m.id === moveId || m.id === moveId.toLowerCase().replace(/\s/g, ""));
+              
+              return {
+                move: typeof move === "string" ? move : move.name || move.id || `Move ${idx + 1}`,
+                id: moveId.toLowerCase().replace(/\s/g, ""),
+                pp: psMove?.pp ?? ((active as any).volatile?.pp?.[moveId] ?? move.pp ?? 10),
+                maxpp: psMove?.maxpp ?? move.maxpp ?? move.pp ?? 10,
+                target: psMove?.target || move.target || "normal",
+                disabled: psMove?.disabled || move.disabled || false,
+              };
+            }),
+          }],
+        };
     
     sock.emit("promptAction", {
       roomId: room.id,
       playerId: player.id,
-      prompt: moveRequest,
+      prompt,
       state: state,
     });
+
+    room.lastPromptByPlayer[player.id] = {
+      turn,
+      type: promptType,
+      rqid: (prompt as any).rqid,
+    };
   }
 }
 

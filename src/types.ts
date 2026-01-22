@@ -85,6 +85,7 @@ export interface Pokemon {
 	volatile: Record<string, any>; // confusion, etc.
 	ability?: string; // id
 	item?: string; // id
+	shiny?: boolean; // shiny flag for sprite display
 	moves: Move[];
 }
 
