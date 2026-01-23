@@ -1090,9 +1090,19 @@ io.on("connection", (socket: Socket) => {
     if (!room) return socket.emit("error", { error: "room not found" });
     
     // Validate sender is a player in the room and matches playerId
-    const sender = room.players.find((p) => p.socketId === socket.id);
+    let sender = room.players.find((p) => p.socketId === socket.id);
     if (!sender || sender.id !== data.playerId) {
-      return socket.emit("error", { error: "not authorized for this action" });
+      const inRoom = socket.rooms.has(room.id);
+      const statePlayer = room.engine?.getState().players.find((p) => p.id === data.playerId);
+      if (inRoom && statePlayer) {
+        console.warn(`[Server] Recovering missing room player for ${data.playerId} (socket ${socket.id})`);
+        // Upsert player record so future prompts/actions have a live socket
+        room.players = room.players.filter((p) => p.id !== data.playerId && p.socketId !== socket.id);
+        room.players.push({ id: data.playerId, username: statePlayer.name || data.playerId, socketId: socket.id, trainerSprite: (statePlayer as any).trainerSprite });
+        sender = room.players.find((p) => p.socketId === socket.id);
+      } else {
+        return socket.emit("error", { error: "not authorized for this action" });
+      }
     }
     
     // Handle team preview phase
