@@ -46,6 +46,8 @@ export interface Room {
   forceSwitchNeeded?: Set<string>;
   forceSwitchTimer?: NodeJS.Timeout;
   forceSwitchDeadline?: number; // epoch ms
+  turnTimer?: NodeJS.Timeout;
+  turnDeadline?: number; // epoch ms for turn timeout
   challenges: Map<string, Challenge>;
   lastPromptByPlayer?: Record<string, { turn: number; type: "move" | "wait" | "switch" | "team"; rqid?: number }>;
   // Team preview state
@@ -110,6 +112,8 @@ function createRoomRecord(id: string, name: string): Room {
     forceSwitchNeeded: new Set(),
     forceSwitchTimer: undefined,
     forceSwitchDeadline: undefined,
+    turnTimer: undefined,
+    turnDeadline: undefined,
     challenges: new Map(),
     lastPromptByPlayer: {},
   };
@@ -595,16 +599,37 @@ function emitMovePrompts(room: Room, state: BattleState) {
   if (!room.engine) return;
   const turn = state.turn || 1;
   if (!room.lastPromptByPlayer) room.lastPromptByPlayer = {};
+  
+  // Start turn timer when prompts are sent (if not already in a waiting state)
+  if (Object.keys(room.turnBuffer).length === 0) {
+    startTurnTimer(room);
+    console.log(`[Server] Turn timer started for room ${room.id} turn ${turn} (${TURN_TIMEOUT_MS}ms)`);
+  }
+  
+  const promptedPlayers: string[] = [];
+  const skippedPlayers: { id: string; reason: string }[] = [];
+  
   for (const player of state.players) {
     const candidateSockets = room.players.filter((p) => p.id === player.id).map((p) => p.socketId);
     const playerSocket = candidateSockets.find((id) => io.sockets.sockets.has(id));
-    if (!playerSocket) continue;
+    if (!playerSocket) {
+      skippedPlayers.push({ id: player.id, reason: "no valid socket" });
+      continue;
+    }
     const sock = io.sockets.sockets.get(playerSocket);
-    if (!sock) continue;
+    if (!sock) {
+      skippedPlayers.push({ id: player.id, reason: "socket not found" });
+      continue;
+    }
     
     const active = player.team[player.activeIndex];
-    if (!active || active.currentHP <= 0) continue;
+    if (!active || active.currentHP <= 0) {
+      skippedPlayers.push({ id: player.id, reason: "active fainted" });
+      continue;
+    }
     const alreadyActed = !!room.turnBuffer[player.id];
+    
+    promptedPlayers.push(player.id);
     
     // Get the PS engine's native request - this has the correct pokemon array ordering
     // PS reorders the pokemon array after switches so active is always at index 0
@@ -724,6 +749,8 @@ function emitMovePrompts(room: Room, state: BattleState) {
       rqid: (prompt as any).rqid,
     };
   }
+  
+  console.log(`[Server] emitMovePrompts turn=${turn}: prompted=${JSON.stringify(promptedPlayers)} skipped=${JSON.stringify(skippedPlayers)}`);
 }
 
 // Emit force-switch prompts to players who need to switch due to fainted Pokemon
@@ -944,6 +971,153 @@ function clearForceSwitchTimer(room: Room) {
     room.forceSwitchTimer = undefined;
   }
   room.forceSwitchDeadline = undefined;
+}
+
+// Turn timeout - auto-fill missing player actions if they don't respond in time
+const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 30000); // 30 seconds default
+
+function startTurnTimer(room: Room) {
+  clearTurnTimer(room);
+  room.turnDeadline = Date.now() + TURN_TIMEOUT_MS;
+  room.turnTimer = setTimeout(() => {
+    if (!room.engine || room.phase === "force-switch" || room.phase === "team-preview") return;
+    const state = room.engine.getState();
+    const expected = state.players.length;
+    if (Object.keys(room.turnBuffer).length >= expected) return; // Already complete
+    
+    console.log(`[Server] Turn timeout - auto-filling missing actions`);
+    
+    // Auto-fill for all players who haven't submitted
+    for (const player of state.players) {
+      if (room.turnBuffer[player.id]) continue;
+      
+      const active = player.team?.[player.activeIndex];
+      if (!active) continue;
+      
+      const opponent = state.players.find((p) => p.id !== player.id);
+      const opponentActive = opponent?.team?.[opponent.activeIndex];
+      
+      let autoMoveId = "default";
+      if (room.engine instanceof SyncPSEngine) {
+        const req = room.engine.getRequest(player.id) as any;
+        const reqMoveId = req?.active?.[0]?.moves?.[0]?.id as string | undefined;
+        if (reqMoveId) autoMoveId = reqMoveId;
+      } else if (active?.moves?.length) {
+        const fallbackMove = active.moves[0] as any;
+        autoMoveId = typeof fallbackMove === "string" ? fallbackMove : (fallbackMove?.id || fallbackMove?.name || "default");
+      }
+      
+      room.turnBuffer[player.id] = {
+        type: "move",
+        actorPlayerId: player.id,
+        pokemonId: active.id,
+        moveId: autoMoveId,
+        targetPlayerId: opponent?.id || "",
+        targetPokemonId: opponentActive?.id || "",
+      } as MoveAction;
+      console.warn(`[Server] Turn timeout auto-filled action for player ${player.id}: move ${autoMoveId}`);
+    }
+    
+    // Now process the turn with all actions
+    if (Object.keys(room.turnBuffer).length >= expected) {
+      processTurnWithBuffer(room);
+    }
+  }, TURN_TIMEOUT_MS);
+}
+
+function clearTurnTimer(room: Room) {
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = undefined;
+  }
+  room.turnDeadline = undefined;
+}
+
+// Helper to process turn when buffer is full - extracted from sendAction handler
+function processTurnWithBuffer(room: Room) {
+  if (!room.engine) return;
+  const state = room.engine.getState();
+  const actions = Object.values(room.turnBuffer);
+  room.turnBuffer = {};
+  clearTurnTimer(room);
+  
+  // Filter to only battle actions (move/switch)
+  const battleActions = actions.filter((a): a is import("../types").BattleAction => a.type === "move" || a.type === "switch");
+  console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: (a as any).moveId, targetPokemonId: (a as any).targetPokemonId } : {}) }))));
+  let result: TurnResult = room.engine.processTurn(battleActions);
+
+  // Filter duplicate start/switch batches after start protocol has already been sent
+  if (room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
+    const hasActionLine = result.events.some((l) =>
+      l.startsWith("|move|") ||
+      l.startsWith("|cant|") ||
+      l.startsWith("|-damage|") ||
+      l.startsWith("|damage|") ||
+      l.startsWith("|-heal|") ||
+      l.startsWith("|heal|") ||
+      l.startsWith("|faint|") ||
+      l.startsWith("|-")
+    );
+
+    if (!hasActionLine) {
+      result = { ...result, events: [], anim: [] };
+    } else {
+      const initPrefixes = [
+        "|start",
+        "|teampreview",
+        "|clearpoke",
+        "|poke|",
+        "|player|",
+        "|teamsize|",
+        "|gen|",
+        "|tier|",
+        "|gametype|",
+        "|t:|",
+        "|split|",
+      ];
+      const filteredEvents = result.events.filter((line) => {
+        if (line === "|") return false;
+        return !initPrefixes.some((prefix) => line.startsWith(prefix));
+      });
+      result = { ...result, events: filteredEvents };
+    }
+  }
+
+  if (!room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
+    room.startProtocolSent = true;
+  }
+
+  room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
+  const needsSwitch: string[] = computeNeedsSwitch(result.state);
+  if (needsSwitch.length > 0) {
+    room.phase = "force-switch";
+    room.forceSwitchNeeded = new Set(needsSwitch);
+    io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
+    startForceSwitchTimer(room);
+    // Emit force-switch prompts to players who need to switch
+    emitForceSwitchPrompts(room, result.state, needsSwitch);
+  }
+  if (Array.isArray(result?.events)) {
+    const hasStart = result.events.some((l) => l === "|start" || l.startsWith("|start|"));
+    const hasTurn = result.events.some((l) => l.startsWith("|turn|"));
+    const sample = result.events.slice(0, 8);
+    console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=${result.events.length} start=${hasStart} turn=${hasTurn} sample=${JSON.stringify(sample)}`);
+  } else {
+    console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=none`);
+  }
+  io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
+  // Simple end detection: if any player's active mon is fainted and no healthy mons remain
+  const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));
+  if (sideDefeated) {
+    const winner = result.state.players.find(pl => pl.id !== sideDefeated.id)?.id;
+    const replayId = saveReplay(room);
+    io.to(room.id).emit("battleEnd", { winner, replayId });
+    clearForceSwitchTimer(room);
+    clearTurnTimer(room);
+  } else if (needsSwitch.length === 0) {
+    // Emit new move prompts for the next turn
+    emitMovePrompts(room, result.state);
+  }
 }
 
 io.on("connection", (socket: Socket) => {
@@ -1286,84 +1460,7 @@ io.on("connection", (socket: Socket) => {
 
     console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
     if (Object.keys(room.turnBuffer).length >= expected) {
-      const actions = Object.values(room.turnBuffer);
-      room.turnBuffer = {};
-      // Filter to only battle actions (move/switch)
-      const battleActions = actions.filter((a): a is import("../types").BattleAction => a.type === "move" || a.type === "switch");
-      console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: (a as any).moveId, targetPokemonId: (a as any).targetPokemonId } : {}) }))));
-      let result: TurnResult = room.engine.processTurn(battleActions);
-
-      // Filter duplicate start/switch batches after start protocol has already been sent
-      if (room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
-        const hasActionLine = result.events.some((l) =>
-          l.startsWith("|move|") ||
-          l.startsWith("|cant|") ||
-          l.startsWith("|-damage|") ||
-          l.startsWith("|damage|") ||
-          l.startsWith("|-heal|") ||
-          l.startsWith("|heal|") ||
-          l.startsWith("|faint|") ||
-          l.startsWith("|-")
-        );
-
-        if (!hasActionLine) {
-          result = { ...result, events: [], anim: [] };
-        } else {
-          const initPrefixes = [
-            "|start",
-            "|teampreview",
-            "|clearpoke",
-            "|poke|",
-            "|player|",
-            "|teamsize|",
-            "|gen|",
-            "|tier|",
-            "|gametype|",
-            "|t:|",
-            "|split|",
-          ];
-          const filteredEvents = result.events.filter((line) => {
-            if (line === "|") return false;
-            return !initPrefixes.some((prefix) => line.startsWith(prefix));
-          });
-          result = { ...result, events: filteredEvents };
-        }
-      }
-
-      if (!room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
-        room.startProtocolSent = true;
-      }
-
-      room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
-      const needsSwitch: string[] = computeNeedsSwitch(result.state);
-      if (needsSwitch.length > 0) {
-        room.phase = "force-switch";
-        room.forceSwitchNeeded = new Set(needsSwitch);
-        io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
-        startForceSwitchTimer(room);
-        // Emit force-switch prompts to players who need to switch
-        emitForceSwitchPrompts(room, result.state, needsSwitch);
-      }
-      if (Array.isArray(result?.events)) {
-        const hasStart = result.events.some((l) => l === "|start" || l.startsWith("|start|"));
-        const hasTurn = result.events.some((l) => l.startsWith("|turn|"));
-        const sample = result.events.slice(0, 8);
-        console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=${result.events.length} start=${hasStart} turn=${hasTurn} sample=${JSON.stringify(sample)}`);
-      } else {
-        console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=none`);
-      }
-      io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
-      // Simple end detection: if any player's active mon is fainted and no healthy mons remain
-      const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));
-      if (sideDefeated) {
-        const winner = result.state.players.find(pl => pl.id !== sideDefeated.id)?.id;
-        const replayId = saveReplay(room);
-        io.to(room.id).emit("battleEnd", { winner, replayId });
-        clearForceSwitchTimer(room);
-      } else if (needsSwitch.length === 0) {
-        // Emit new move prompts for the next turn
-        emitMovePrompts(room, result.state);
-      }
+      processTurnWithBuffer(room);
     } else {
       // Send "waiting" notification ONLY to the player who just submitted
       // Not to all players - that would incorrectly put both in waiting state
