@@ -596,7 +596,8 @@ function emitMovePrompts(room: Room, state: BattleState) {
   const turn = state.turn || 1;
   if (!room.lastPromptByPlayer) room.lastPromptByPlayer = {};
   for (const player of state.players) {
-    const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
+    const candidateSockets = room.players.filter((p) => p.id === player.id).map((p) => p.socketId);
+    const playerSocket = candidateSockets.find((id) => io.sockets.sockets.has(id));
     if (!playerSocket) continue;
     const sock = io.sockets.sockets.get(playerSocket);
     if (!sock) continue;
@@ -990,9 +991,37 @@ io.on("connection", (socket: Socket) => {
     if (!room) return socket.emit("error", { error: "room not found" });
     socket.join(room.id);
     if (data.role === "player") {
-      room.players.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
+      // De-duplicate any stale entries for this user/socket
+      room.spectators = room.spectators.filter((s) => s.id !== user.id && s.socketId !== socket.id);
+      room.players = room.players.filter((p) => p.socketId !== socket.id || p.id === user.id);
+      const existingIndex = room.players.findIndex((p) => p.id === user.id);
+      if (existingIndex >= 0) {
+        room.players[existingIndex] = {
+          ...room.players[existingIndex],
+          id: user.id,
+          username: user.username,
+          socketId: socket.id,
+          trainerSprite: user.trainerSprite,
+        };
+      } else {
+        room.players.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
+      }
     } else {
-      room.spectators.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
+      // De-duplicate any stale entries for this user/socket
+      room.players = room.players.filter((p) => p.id !== user.id && p.socketId !== socket.id);
+      room.spectators = room.spectators.filter((s) => s.socketId !== socket.id || s.id === user.id);
+      const existingIndex = room.spectators.findIndex((s) => s.id === user.id);
+      if (existingIndex >= 0) {
+        room.spectators[existingIndex] = {
+          ...room.spectators[existingIndex],
+          id: user.id,
+          username: user.username,
+          socketId: socket.id,
+          trainerSprite: user.trainerSprite,
+        };
+      } else {
+        room.spectators.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
+      }
       // Send spectator snapshot if battle started
       if (room.battleStarted && room.engine) {
   const state = room.engine.getState();
