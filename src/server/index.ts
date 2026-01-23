@@ -310,6 +310,14 @@ app.get("/api/rooms/:id/snapshot", (req: Request, res: Response) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+process.on("uncaughtException", (err) => {
+  console.error("[Server] Uncaught exception:", err?.stack || err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("[Server] Unhandled rejection:", err);
+});
+
 function emitChallengeCreated(room: Room, challenge: Challenge) {
   io.to(room.id).emit("challengeCreated", { roomId: room.id, challenge: challengeSummary(challenge) });
 }
@@ -476,6 +484,7 @@ function checkTeamPreviewComplete(room: Room) {
 }
 
 function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) {
+  try {
   // Check if team preview is enabled
   if (rules?.teamPreview && room.phase !== "team-preview") {
     startTeamPreview(room, players, rules);
@@ -542,6 +551,19 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   
   // Emit move prompts to each player so they can choose their first action
   emitMovePrompts(room, state);
+  } catch (err: any) {
+    console.error(`[Server] beginBattle failed for room ${room.id}:`, err?.stack || err);
+    room.engine = undefined;
+    room.battleStarted = false;
+    room.startProtocolSent = false;
+    room.phase = "normal";
+    room.turnBuffer = {};
+    room.forceSwitchNeeded = new Set();
+    io.to(room.id).emit("battleStartError", {
+      roomId: room.id,
+      message: err?.message || "Failed to start battle",
+    });
+  }
 }
 
 function buildInitialBattleProtocol(state: BattleState): string[] {
