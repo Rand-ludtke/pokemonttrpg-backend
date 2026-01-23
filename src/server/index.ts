@@ -594,6 +594,38 @@ function buildInitialBattleProtocol(state: BattleState): string[] {
   return lines;
 }
 
+// Deduplicate consecutive identical switch/drag lines (PS protocol sends private + public copies)
+function deduplicateSwitchLines(events: string[]): string[] {
+  const result: string[] = [];
+  const seenSwitches = new Set<string>();
+  
+  for (let i = 0; i < events.length; i++) {
+    const line = events[i];
+    
+    // Check if this is a switch/drag line
+    if (line.startsWith('|switch|') || line.startsWith('|drag|') || line.startsWith('|replace|')) {
+      // Extract just the identity part (e.g., "p1a: Typhlosion") to compare
+      const parts = line.split('|');
+      const ident = parts[2] || ''; // e.g., "p1a: Typhlosion"
+      
+      // Skip if we've already seen this exact switch in this batch
+      if (seenSwitches.has(ident)) {
+        continue;
+      }
+      seenSwitches.add(ident);
+    }
+    
+    // Skip |split| lines entirely - they're PS internal markers
+    if (line.startsWith('|split|')) {
+      continue;
+    }
+    
+    result.push(line);
+  }
+  
+  return result;
+}
+
 // Emit move prompts to all players in a battle
 function emitMovePrompts(room: Room, state: BattleState) {
   if (!room.engine) return;
@@ -974,7 +1006,8 @@ function clearForceSwitchTimer(room: Room) {
 }
 
 // Turn timeout - auto-fill missing player actions if they don't respond in time
-const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 30000); // 30 seconds default
+// Set TURN_TIMEOUT_MS env var to customize (in milliseconds). Default is 60 seconds.
+const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 60000); // 60 seconds default
 
 function startTurnTimer(room: Room) {
   clearTurnTimer(room);
@@ -983,9 +1016,13 @@ function startTurnTimer(room: Room) {
     if (!room.engine || room.phase === "force-switch" || room.phase === "team-preview") return;
     const state = room.engine.getState();
     const expected = state.players.length;
-    if (Object.keys(room.turnBuffer).length >= expected) return; // Already complete
+    const submitted = Object.keys(room.turnBuffer);
+    if (submitted.length >= expected) return; // Already complete
     
-    console.log(`[Server] Turn timeout - auto-filling missing actions`);
+    // Log detailed info about who hasn't submitted
+    const missing = state.players.filter(p => !room.turnBuffer[p.id]).map(p => p.id);
+    console.warn(`[Server] Turn ${state.turn} timeout - auto-filling for ${missing.length} players who didn't respond: ${missing.join(', ')}`);
+    console.warn(`[Server] Submitted: ${submitted.join(', ') || 'none'} | Missing: ${missing.join(', ')}`);
     
     // Auto-fill for all players who haven't submitted
     for (const player of state.players) {
@@ -1045,6 +1082,11 @@ function processTurnWithBuffer(room: Room) {
   const battleActions = actions.filter((a): a is import("../types").BattleAction => a.type === "move" || a.type === "switch");
   console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: (a as any).moveId, targetPokemonId: (a as any).targetPokemonId } : {}) }))));
   let result: TurnResult = room.engine.processTurn(battleActions);
+
+  // Deduplicate switch lines (PS sends private + public copies after |split| markers)
+  if (Array.isArray(result.events)) {
+    result = { ...result, events: deduplicateSwitchLines(result.events) };
+  }
 
   // Filter duplicate start/switch batches after start protocol has already been sent
   if (room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
@@ -1333,7 +1375,11 @@ io.on("connection", (socket: Socket) => {
         }
       }
       // Perform immediate forced switch via engine
-      const res = room.engine.forceSwitch(data.playerId, (data.action as any).toIndex);
+      let res = room.engine.forceSwitch(data.playerId, (data.action as any).toIndex);
+      // Deduplicate switch lines (PS sends private + public copies)
+      if (Array.isArray(res.events)) {
+        res = { ...res, events: deduplicateSwitchLines(res.events) };
+      }
       room.replay.push({ turn: res.state.turn, events: res.events, anim: res.anim, phase: "force-switch" });
       room.forceSwitchNeeded.delete(data.playerId);
       {
