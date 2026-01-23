@@ -1273,6 +1273,14 @@ io.on("connection", (socket: Socket) => {
         // Emit force-switch prompts to players who need to switch
         emitForceSwitchPrompts(room, result.state, needsSwitch);
       }
+      if (Array.isArray(result?.events)) {
+        const hasStart = result.events.some((l) => l === "|start" || l.startsWith("|start|"));
+        const hasTurn = result.events.some((l) => l.startsWith("|turn|"));
+        const sample = result.events.slice(0, 8);
+        console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=${result.events.length} start=${hasStart} turn=${hasTurn} sample=${JSON.stringify(sample)}`);
+      } else {
+        console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=none`);
+      }
       io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
       // Simple end detection: if any player's active mon is fainted and no healthy mons remain
       const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));

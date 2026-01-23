@@ -275,6 +275,12 @@ export class SyncPSEngine {
 
 		// Collect log entries after the turn processes
 		events.push(...this.collectNewLogEntries());
+		if (events.length > 0) {
+			const hasStart = events.some((l) => l === "|start" || l.startsWith("|start|"));
+			const hasTurn = events.some((l) => l.startsWith("|turn|"));
+			const sample = events.slice(0, 8);
+			console.log(`[DIAG-PROTOCOL] [engine] turn=${this.battle.turn} events=${events.length} start=${hasStart} turnLine=${hasTurn} sample=${JSON.stringify(sample)}`);
+		}
 		anim.push(...this.parseLogToAnimations(events));
 
 		// Update our state
