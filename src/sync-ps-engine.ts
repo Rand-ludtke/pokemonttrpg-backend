@@ -198,6 +198,33 @@ export class SyncPSEngine {
 	}
 
 	/**
+	 * Get the active Pokemon's moves with current PP directly from PS engine
+	 * This is useful as a fallback when activeRequest is not available
+	 */
+	getActiveMovesPP(playerId: string): Array<{ id: string; name: string; pp: number; maxpp: number; target: string; disabled: boolean }> | null {
+		if (!this.battle) return null;
+		const side = this.playerIdToSide.get(playerId);
+		if (!side) return null;
+
+		const psSide = this.battle.sides.find((s: any) => s.id === side);
+		if (!psSide) return null;
+
+		const activePokemon = psSide.active?.[0];
+		if (!activePokemon) return null;
+
+		// PS stores move data in moveSlots array
+		const moveSlots = activePokemon.moveSlots || activePokemon.baseMoveSlots || [];
+		return moveSlots.map((slot: any) => ({
+			id: slot.id || slot.move?.toLowerCase().replace(/[^a-z0-9]/g, '') || '',
+			name: slot.move || slot.name || '',
+			pp: slot.pp ?? slot.maxpp ?? 10,
+			maxpp: slot.maxpp ?? 10,
+			target: slot.target || 'normal',
+			disabled: slot.disabled || false,
+		}));
+	}
+
+	/**
 	 * Check if a player needs to make a force switch
 	 */
 	needsForceSwitch(playerId: string): boolean {

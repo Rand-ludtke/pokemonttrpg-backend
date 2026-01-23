@@ -717,6 +717,13 @@ function emitMovePrompts(room: Room, state: BattleState) {
     // Note: This won't have the correct pokemon ordering after switches
     const psActiveMoves = psRequest?.active?.[0]?.moves || [];
     
+    // Also try to get PP data directly from PS engine as a backup
+    let engineMovesPP: Array<{ id: string; name: string; pp: number; maxpp: number; target: string; disabled: boolean }> | null = null;
+    if (room.engine instanceof SyncPSEngine && psActiveMoves.length === 0) {
+      engineMovesPP = room.engine.getActiveMovesPP(player.id);
+      console.log(`[Server] Using engineMovesPP fallback for ${player.id}:`, engineMovesPP);
+    }
+    
     const sidePayload = {
         id: sideId,
         name: player.name || player.id,
@@ -754,15 +761,25 @@ function emitMovePrompts(room: Room, state: BattleState) {
           active: [{
             moves: (active.moves || []).map((move: any, idx: number) => {
               const moveId = typeof move === "string" ? move : move.id || move.name || `move${idx}`;
-              const psMove = psActiveMoves.find((m: any) => m.id === moveId || m.id === moveId.toLowerCase().replace(/\s/g, ""));
+              const normalizedMoveId = moveId.toLowerCase().replace(/[^a-z0-9]/g, "");
+              
+              // Try to find PP from multiple sources:
+              // 1. psActiveMoves from activeRequest
+              // 2. engineMovesPP from direct PS engine query
+              // 3. Fall back to defaults
+              const psMove = psActiveMoves.find((m: any) => m.id === normalizedMoveId || m.id === moveId);
+              const engineMove = engineMovesPP?.find((m: any) => m.id === normalizedMoveId || m.id === moveId);
+              
+              const pp = psMove?.pp ?? engineMove?.pp ?? move.pp ?? 10;
+              const maxpp = psMove?.maxpp ?? engineMove?.maxpp ?? move.maxpp ?? pp;
               
               return {
                 move: typeof move === "string" ? move : move.name || move.id || `Move ${idx + 1}`,
-                id: moveId.toLowerCase().replace(/\s/g, ""),
-                pp: psMove?.pp ?? ((active as any).volatile?.pp?.[moveId] ?? move.pp ?? 10),
-                maxpp: psMove?.maxpp ?? move.maxpp ?? move.pp ?? 10,
-                target: psMove?.target || move.target || "normal",
-                disabled: psMove?.disabled || move.disabled || false,
+                id: normalizedMoveId,
+                pp,
+                maxpp,
+                target: psMove?.target ?? engineMove?.target ?? move.target ?? "normal",
+                disabled: psMove?.disabled ?? engineMove?.disabled ?? move.disabled ?? false,
               };
             }),
           }],
