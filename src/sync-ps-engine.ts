@@ -122,21 +122,27 @@ export class SyncPSEngine {
 			coinFlipWinner: undefined,
 		};
 
+		// Start the battle if the simulator exposes start()
+		if (this.battle && typeof (this.battle as any).start === "function") {
+			(this.battle as any).start();
+		}
+
 		// Sync initial state
 		this.syncStateFromPS();
 
 		// Auto-complete Team Preview if needed (server handles ordering before this)
 		if (this.battle) {
-			// Check if sides are waiting for team preview
-			// Using any cast to access PS internal side properties if needed, though they are usually public on the instance
 			const p1 = this.battle.p1 as any;
 			const p2 = this.battle.p2 as any;
+			const p1TeamSize = this.state.players?.[0]?.team?.length || 6;
+			const p2TeamSize = this.state.players?.[1]?.team?.length || 6;
+			const buildTeamOrder = (size: number) => `team ${Array.from({ length: size }, (_v, i) => i + 1).join("")}`;
 			
 			if (p1?.request?.teamPreview) {
-				this.battle.choose('p1', 'team 123456');
+				this.battle.choose("p1", buildTeamOrder(p1TeamSize));
 			}
 			if (p2?.request?.teamPreview) {
-				this.battle.choose('p2', 'team 123456');
+				this.battle.choose("p2", buildTeamOrder(p2TeamSize));
 			}
 			
 			// Re-sync state in case turn advanced

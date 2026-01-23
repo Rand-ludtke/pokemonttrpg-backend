@@ -39,6 +39,7 @@ export interface Room {
   spectators: { id: string; username: string; socketId: string; trainerSprite?: string }[];
   engine?: BattleEngine;
   battleStarted: boolean;
+  startProtocolSent?: boolean;
   turnBuffer: Record<string, Action>; // keyed by player id
   replay: any[];
   phase?: "normal" | "force-switch" | "team-preview";
@@ -99,6 +100,7 @@ function createRoomRecord(id: string, name: string): Room {
     spectators: [],
     engine: undefined,
     battleStarted: false,
+    startProtocolSent: false,
     turnBuffer: {},
     replay: [],
     phase: "normal",
@@ -519,6 +521,7 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   // This prevents a pre-start move prompt from showing before the battle is visually started.
   // ONLY do this if the engine hasn't already generated start events (SyncPSEngine now does)
   const hasStart = Array.isArray(state.log) && state.log.some((l: string) => l.startsWith("|start"));
+  if (hasStart) room.startProtocolSent = true;
   
   if (!hasStart) {
     const initialEvents = buildInitialBattleProtocol(state);
@@ -529,6 +532,7 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
           if (!state.log.includes(line)) state.log.push(line);
         }
       }
+      room.startProtocolSent = true;
       io.to(room.id).emit("battleUpdate", {
         result: { state, events: initialEvents, anim: [] },
         needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
@@ -1010,6 +1014,7 @@ io.on("connection", (socket: Socket) => {
     
     // Only verify/inject start events if the engine hasn't already done so
     const hasStart = Array.isArray(state.log) && state.log.some((l: string) => l.startsWith("|start"));
+    if (hasStart) room.startProtocolSent = true;
     
     if (!hasStart) {
       const initialEvents = buildInitialBattleProtocol(state);
@@ -1019,6 +1024,7 @@ io.on("connection", (socket: Socket) => {
             if (!state.log.includes(line)) state.log.push(line);
           }
         }
+        room.startProtocolSent = true;
         io.to(room.id).emit("battleUpdate", {
           result: { state, events: initialEvents, anim: [] },
           needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
@@ -1192,7 +1198,49 @@ io.on("connection", (socket: Socket) => {
       // Filter to only battle actions (move/switch)
       const battleActions = actions.filter((a): a is import("../types").BattleAction => a.type === "move" || a.type === "switch");
       console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: (a as any).moveId, targetPokemonId: (a as any).targetPokemonId } : {}) }))));
-      const result: TurnResult = room.engine.processTurn(battleActions);
+      let result: TurnResult = room.engine.processTurn(battleActions);
+
+      // Filter duplicate start/switch batches after start protocol has already been sent
+      if (room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
+        const hasActionLine = result.events.some((l) =>
+          l.startsWith("|move|") ||
+          l.startsWith("|cant|") ||
+          l.startsWith("|-damage|") ||
+          l.startsWith("|damage|") ||
+          l.startsWith("|-heal|") ||
+          l.startsWith("|heal|") ||
+          l.startsWith("|faint|") ||
+          l.startsWith("|-")
+        );
+
+        if (!hasActionLine) {
+          result = { ...result, events: [], anim: [] };
+        } else {
+          const initPrefixes = [
+            "|start",
+            "|teampreview",
+            "|clearpoke",
+            "|poke|",
+            "|player|",
+            "|teamsize|",
+            "|gen|",
+            "|tier|",
+            "|gametype|",
+            "|t:|",
+            "|split|",
+          ];
+          const filteredEvents = result.events.filter((line) => {
+            if (line === "|") return false;
+            return !initPrefixes.some((prefix) => line.startsWith(prefix));
+          });
+          result = { ...result, events: filteredEvents };
+        }
+      }
+
+      if (!room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
+        room.startProtocolSent = true;
+      }
+
       room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
       const needsSwitch: string[] = computeNeedsSwitch(result.state);
       if (needsSwitch.length > 0) {
