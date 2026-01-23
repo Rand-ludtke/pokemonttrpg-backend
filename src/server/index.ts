@@ -1252,6 +1252,38 @@ io.on("connection", (socket: Socket) => {
     console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(processedAction));
     const currentState = room.engine.getState();
     const expected = currentState.players.length;
+
+    // Auto-fill missing players if they are no longer connected
+    const livePlayerIds = new Set(
+      room.players.filter((p) => io.sockets.sockets.has(p.socketId)).map((p) => p.id)
+    );
+    const missingPlayers = currentState.players.filter((p) => !livePlayerIds.has(p.id));
+    for (const missing of missingPlayers) {
+      if (room.turnBuffer[missing.id]) continue;
+      const active = missing.team?.[missing.activeIndex];
+      if (!active) continue;
+      const opponent = currentState.players.find((p) => p.id !== missing.id);
+      const opponentActive = opponent?.team?.[opponent.activeIndex];
+      let autoMoveId = "default";
+      if (room.engine instanceof SyncPSEngine) {
+        const req = room.engine.getRequest(missing.id) as any;
+        const reqMoveId = req?.active?.[0]?.moves?.[0]?.id as string | undefined;
+        if (reqMoveId) autoMoveId = reqMoveId;
+      } else if (active?.moves?.length) {
+        const fallbackMove = active.moves[0] as any;
+        autoMoveId = typeof fallbackMove === "string" ? fallbackMove : (fallbackMove?.id || fallbackMove?.name || "default");
+      }
+      room.turnBuffer[missing.id] = {
+        type: "move",
+        actorPlayerId: missing.id,
+        pokemonId: active.id,
+        moveId: autoMoveId,
+        targetPlayerId: opponent?.id || "",
+        targetPokemonId: opponentActive?.id || "",
+      } as MoveAction;
+      console.warn(`[Server] Auto-filled action for missing player ${missing.id}: move ${autoMoveId}`);
+    }
+
     console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
     if (Object.keys(room.turnBuffer).length >= expected) {
       const actions = Object.values(room.turnBuffer);

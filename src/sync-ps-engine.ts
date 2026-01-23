@@ -448,6 +448,9 @@ export class SyncPSEngine {
 	private actionToChoice(action: BattleAction, side: "p1" | "p2"): string | null {
 		if (action.type === "move") {
 			const moveAction = action as MoveAction;
+			if (!moveAction.moveId || moveAction.moveId === "default") {
+				return "default";
+			}
 			const moveIndex = this.findMoveIndex(moveAction.moveId, side);
 			let choice = `move ${moveIndex}`;
 			if (moveAction.mega) choice += " mega";
