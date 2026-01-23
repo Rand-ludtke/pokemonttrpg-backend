@@ -125,6 +125,24 @@ export class SyncPSEngine {
 		// Sync initial state
 		this.syncStateFromPS();
 
+		// Auto-complete Team Preview if needed (server handles ordering before this)
+		if (this.battle) {
+			// Check if sides are waiting for team preview
+			// Using any cast to access PS internal side properties if needed, though they are usually public on the instance
+			const p1 = this.battle.p1 as any;
+			const p2 = this.battle.p2 as any;
+			
+			if (p1?.request?.teamPreview) {
+				this.battle.choose('p1', 'team 123456');
+			}
+			if (p2?.request?.teamPreview) {
+				this.battle.choose('p2', 'team 123456');
+			}
+			
+			// Re-sync state in case turn advanced
+			this.syncStateFromPS();
+		}
+
 		// Capture initial PS log entries (setup, switch-ins, turn start)
 		this.collectNewLogEntries();
 
