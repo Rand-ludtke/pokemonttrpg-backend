@@ -124,7 +124,17 @@ export class SyncPSEngine {
 
 		// Start the battle if the simulator exposes start()
 		if (this.battle && typeof (this.battle as any).start === "function") {
-			(this.battle as any).start();
+			const alreadyStarted = (this.battle as any).started || (this.battle as any).turn > 0;
+			if (!alreadyStarted) {
+				try {
+					(this.battle as any).start();
+				} catch (err: any) {
+					const msg = String(err?.message || err || "");
+					if (!/already started/i.test(msg)) {
+						throw err;
+					}
+				}
+			}
 		}
 
 		// Sync initial state
