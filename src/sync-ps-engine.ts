@@ -250,6 +250,7 @@ export class SyncPSEngine {
 
 		const events: string[] = [];
 		const anim: AnimationEvent[] = [];
+		const prevTurn = this.state.turn;
 
 		// Group actions by player
 		const actionsByPlayer = new Map<string, BattleAction>();
@@ -264,11 +265,24 @@ export class SyncPSEngine {
 
 			const choice = this.actionToChoice(action, side);
 			if (choice) {
+				console.log(`[DIAG-PROTOCOL] [engine] choose side=${side} player=${playerId} choice=${choice}`);
 				const success = this.battle.choose(side, choice);
 				if (!success) {
 					console.error(`[SyncPSEngine] Choice failed for ${side}: ${choice}`);
 					// Try a default choice
 					this.battle.choose(side, "default");
+				}
+			}
+		}
+
+		// Ensure decisions are committed if the simulator didn't advance the turn
+		if (this.battle && typeof (this.battle as any).commitDecisions === "function") {
+			if (this.battle.turn === prevTurn) {
+				console.log(`[DIAG-PROTOCOL] [engine] commitDecisions (turn=${this.battle.turn}, prev=${prevTurn})`);
+				try {
+					(this.battle as any).commitDecisions();
+				} catch (err: any) {
+					console.error(`[SyncPSEngine] commitDecisions failed:`, err?.stack || err);
 				}
 			}
 		}
