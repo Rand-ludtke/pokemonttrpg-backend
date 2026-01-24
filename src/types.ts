@@ -86,6 +86,11 @@ export interface Pokemon {
 	ability?: string; // id
 	item?: string; // id
 	shiny?: boolean; // shiny flag for sprite display
+	teraType?: string; // Terastallization type (Fire, Water, etc.)
+	nature?: string; // Nature for stat calculations
+	evs?: Partial<Record<"hp" | "atk" | "def" | "spa" | "spd" | "spe", number>>;
+	ivs?: Partial<Record<"hp" | "atk" | "def" | "spa" | "spd" | "spe", number>>;
+	gender?: "M" | "F" | "N";
 	moves: Move[];
 }
 

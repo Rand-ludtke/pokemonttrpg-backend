@@ -174,13 +174,13 @@ export class PSEngine {
 			item: mon.item || "",
 			ability: mon.ability || "",
 			moves: mon.moves.map((m) => m.name || m.id),
-			nature: "Hardy", // Default nature
-			evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
-			ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+			nature: (mon as any).nature || "Hardy",
+			evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, ...(mon as any).evs },
+			ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31, ...(mon as any).ivs },
 			level: mon.level,
 			shiny: !!(mon as any).shiny,
-			gender: "",
-			teraType: "",
+			gender: (mon as any).gender || "",
+			teraType: (mon as any).teraType || "",
 		}));
 		return Teams.pack(sets);
 	}

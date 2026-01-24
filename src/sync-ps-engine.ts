@@ -68,9 +68,11 @@ export class SyncPSEngine {
 	private format: string;
 	private lastLogIndex = 0;
 	private startSent = false; // Track if |start| has already been emitted
+	private rules?: any; // Battle rules/clauses
 
-	constructor(private readonly options?: { format?: string; seed?: number | number[] }) {
+	constructor(private readonly options?: { format?: string; seed?: number | number[]; rules?: any }) {
 		this.format = options?.format || "gen9customgame";
+		this.rules = options?.rules;
 	}
 
 	/**
@@ -176,12 +178,13 @@ export class SyncPSEngine {
 			item: mon.item || "",
 			ability: mon.ability || "",
 			moves: mon.moves.map((m) => m.name || m.id),
-			nature: "Hardy",
-			evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
-			ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+			nature: (mon as any).nature || "Hardy",
+			evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, ...(mon as any).evs },
+			ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31, ...(mon as any).ivs },
 			level: mon.level,
 			shiny: !!(mon as any).shiny,
-			gender: "",
+			gender: (mon as any).gender || "",
+			teraType: (mon as any).teraType || "",
 		}));
 		return Teams.pack(sets);
 	}
@@ -329,7 +332,38 @@ export class SyncPSEngine {
 		this.syncStateFromPS();
 		this.state.turn = this.battle.turn;
 
+		// If Unlimited Terastallization clause is enabled, re-enable canTerastallize for all Pokemon after each turn
+		if (this.hasUnlimitedTeraClause()) {
+			this.resetTerastallizeForAll();
+		}
+
 		return { state: this.state, events, anim };
+	}
+
+	/**
+	 * Check if the unlimited terastallization clause is enabled
+	 */
+	private hasUnlimitedTeraClause(): boolean {
+		const clauses = this.rules?.clauses;
+		if (Array.isArray(clauses)) {
+			return clauses.includes('unlimitedtera');
+		}
+		return false;
+	}
+
+	/**
+	 * Re-enable canTerastallize for all Pokemon (for unlimited tera clause)
+	 */
+	private resetTerastallizeForAll(): void {
+		if (!this.battle) return;
+		for (const side of this.battle.sides) {
+			for (const pokemon of (side as any).pokemon || []) {
+				// Only re-enable if the Pokemon has a tera type and hasn't already terastallized this turn
+				if (pokemon.teraType && !pokemon.terastallized) {
+					pokemon.canTerastallize = pokemon.teraType;
+				}
+			}
+		}
 	}
 
 	/**

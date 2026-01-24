@@ -500,7 +500,7 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   // Use Pokemon Showdown engine or custom engine based on configuration
   if (USE_PS_ENGINE) {
     console.log(`[Server] Using Pokemon Showdown battle engine`);
-    room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed });
+    room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed, rules });
   } else {
     console.log(`[Server] Using custom battle engine`);
     room.engine = new Engine({ seed: battleSeed });
@@ -1241,14 +1241,14 @@ io.on("connection", (socket: Socket) => {
     socket.emit("challengeSync", { roomId: room.id, challenges: challengeSummaries(room) });
   });
 
-  socket.on("startBattle", (data: { roomId: string; players: Player[]; seed?: number }) => {
+  socket.on("startBattle", (data: { roomId: string; players: Player[]; seed?: number; rules?: any }) => {
     const room = rooms.get(data.roomId);
     if (!room) return socket.emit("error", { error: "room not found" });
     if (room.battleStarted) return;
     
     const battleSeed = Number.isFinite(data.seed as number) ? (data.seed as number) : undefined;
     if (USE_PS_ENGINE) {
-      room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed });
+      room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed, rules: data.rules });
     } else {
       room.engine = new Engine({ seed: battleSeed });
     }
