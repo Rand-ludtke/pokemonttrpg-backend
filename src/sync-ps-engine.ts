@@ -67,6 +67,7 @@ export class SyncPSEngine {
 	private sideToPlayerId: Map<"p1" | "p2", string> = new Map();
 	private format: string;
 	private lastLogIndex = 0;
+	private startSent = false; // Track if |start| has already been emitted
 
 	constructor(private readonly options?: { format?: string; seed?: number | number[] }) {
 		this.format = options?.format || "gen9customgame";
@@ -333,6 +334,7 @@ export class SyncPSEngine {
 
 	/**
 	 * Collect new log entries from PS battle
+	 * Filters out duplicate |start| blocks that PS may generate
 	 */
 	private collectNewLogEntries(): string[] {
 		if (!this.battle) return [];
@@ -347,7 +349,39 @@ export class SyncPSEngine {
 
 		if (log.length > this.lastLogIndex) {
 			const slice = log.slice(this.lastLogIndex);
+			
+			// Track if we see a duplicate |start| block
+			let inDuplicateStartBlock = false;
+			let seenTurnInBlock = false;
+			
 			for (const entry of slice) {
+				// If we see |start| and we've already sent start, skip this block
+				if (entry === "|start" || entry.startsWith("|start|")) {
+					if (this.startSent) {
+						inDuplicateStartBlock = true;
+						seenTurnInBlock = false;
+						console.log(`[SyncPSEngine] Skipping duplicate |start| block`);
+						continue;
+					} else {
+						this.startSent = true;
+					}
+				}
+				
+				// If we're in a duplicate start block, skip until we see |turn|
+				// Then skip the duplicate |turn| too
+				if (inDuplicateStartBlock) {
+					if (entry.startsWith("|turn|")) {
+						if (!seenTurnInBlock) {
+							seenTurnInBlock = true;
+							continue; // Skip the duplicate turn line
+						}
+						// Second turn line means we're past the duplicate block
+						inDuplicateStartBlock = false;
+					} else {
+						continue; // Skip lines in duplicate start block
+					}
+				}
+				
 				this.state.log.push(entry);
 				newEntries.push(entry);
 			}

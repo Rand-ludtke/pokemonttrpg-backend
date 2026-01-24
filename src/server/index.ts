@@ -972,9 +972,15 @@ rooms.set(DEFAULT_LOBBY_ID, createRoomRecord(DEFAULT_LOBBY_ID, DEFAULT_LOBBY_NAM
 
 const FORCE_SWITCH_TIMEOUT_MS = Number(process.env.FORCE_SWITCH_TIMEOUT_MS || 45000);
 
-export function computeNeedsSwitch(state: import("../types").BattleState): string[] {
+export function computeNeedsSwitch(state: import("../types").BattleState, engine?: SyncPSEngine): string[] {
   const out: string[] = [];
   for (const pl of state.players) {
+    // First check if PS engine says this player needs a force switch
+    if (engine && engine.needsForceSwitch(pl.id)) {
+      out.push(pl.id);
+      continue;
+    }
+    // Fallback: check our state mirror
     const active = pl.team[pl.activeIndex];
     if (active.currentHP <= 0 && pl.team.some((m, idx) => idx !== pl.activeIndex && m.currentHP > 0)) {
       out.push(pl.id);
@@ -1116,7 +1122,8 @@ function processTurnWithBuffer(room: Room) {
   }
 
   room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
-  const needsSwitch: string[] = computeNeedsSwitch(result.state);
+  const needsSwitch: string[] = computeNeedsSwitch(result.state, room.engine instanceof SyncPSEngine ? room.engine : undefined);
+  console.log(`[Server] Turn ${result.state.turn} results: events=${result.events.length} needsSwitch=${needsSwitch.length} (${needsSwitch.join(', ')})`);
   if (needsSwitch.length > 0) {
     room.phase = "force-switch";
     room.forceSwitchNeeded = new Set(needsSwitch);
