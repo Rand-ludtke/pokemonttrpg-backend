@@ -345,10 +345,9 @@ export class SyncPSEngine {
 	 */
 	private hasUnlimitedTeraClause(): boolean {
 		const clauses = this.rules?.clauses;
-		if (Array.isArray(clauses)) {
-			return clauses.includes('unlimitedtera');
-		}
-		return false;
+		const hasClause = Array.isArray(clauses) && clauses.includes('unlimitedtera');
+		console.log(`[SyncPSEngine] hasUnlimitedTeraClause check: rules=${JSON.stringify(this.rules)}, clauses=${JSON.stringify(clauses)}, result=${hasClause}`);
+		return hasClause;
 	}
 
 	/**
@@ -356,14 +355,19 @@ export class SyncPSEngine {
 	 */
 	private resetTerastallizeForAll(): void {
 		if (!this.battle) return;
+		console.log('[SyncPSEngine] resetTerastallizeForAll called - re-enabling tera for all Pokemon');
+		let resetCount = 0;
 		for (const side of this.battle.sides) {
 			for (const pokemon of (side as any).pokemon || []) {
 				// Only re-enable if the Pokemon has a tera type and hasn't already terastallized this turn
 				if (pokemon.teraType && !pokemon.terastallized) {
 					pokemon.canTerastallize = pokemon.teraType;
+					resetCount++;
+					console.log(`[SyncPSEngine] Reset canTerastallize for ${pokemon.name || pokemon.species}: teraType=${pokemon.teraType}`);
 				}
 			}
 		}
+		console.log(`[SyncPSEngine] resetTerastallizeForAll complete - reset ${resetCount} Pokemon`);
 	}
 
 	/**

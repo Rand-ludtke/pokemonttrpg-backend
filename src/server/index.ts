@@ -499,7 +499,7 @@ function beginBattle(room: Room, players: Player[], seed?: number, rules?: any) 
   
   // Use Pokemon Showdown engine or custom engine based on configuration
   if (USE_PS_ENGINE) {
-    console.log(`[Server] Using Pokemon Showdown battle engine`);
+    console.log(`[Server] Using Pokemon Showdown battle engine with rules:`, JSON.stringify(rules));
     room.engine = new SyncPSEngine({ format: "gen9customgame", seed: battleSeed, rules });
   } else {
     console.log(`[Server] Using custom battle engine`);
@@ -595,12 +595,19 @@ function buildInitialBattleProtocol(state: BattleState): string[] {
 }
 
 // Deduplicate consecutive identical switch/drag lines (PS protocol sends private + public copies)
+// Also deduplicate repeated switch events for the same slot within the same turn batch
 function deduplicateSwitchLines(events: string[]): string[] {
   const result: string[] = [];
   const seenSwitches = new Set<string>();
+  const seenSwitchTargets = new Map<string, string>(); // slot -> pokemon name
   
   for (let i = 0; i < events.length; i++) {
     const line = events[i];
+    
+    // Skip |split| lines entirely - they're PS internal markers
+    if (line.startsWith('|split|')) {
+      continue;
+    }
     
     // Check if this is a switch/drag line
     if (line.startsWith('|switch|') || line.startsWith('|drag|') || line.startsWith('|replace|')) {
@@ -608,16 +615,27 @@ function deduplicateSwitchLines(events: string[]): string[] {
       const parts = line.split('|');
       const ident = parts[2] || ''; // e.g., "p1a: Typhlosion"
       
-      // Skip if we've already seen this exact switch in this batch
+      // Extract slot (e.g., "p1a") and pokemon name from ident
+      const identMatch = ident.match(/^(p[12][a-z]?):\s*(.+)$/);
+      if (identMatch) {
+        const slot = identMatch[1];
+        const pokeName = identMatch[2].trim();
+        
+        // Skip if we've already seen a switch to this SAME Pokemon on this SAME slot
+        // (This catches duplicate switch events like "Go! Charizard!" appearing twice)
+        const prevPoke = seenSwitchTargets.get(slot);
+        if (prevPoke && prevPoke.toLowerCase() === pokeName.toLowerCase()) {
+          console.log(`[deduplicateSwitchLines] Skipping duplicate switch: ${slot} -> ${pokeName}`);
+          continue;
+        }
+        seenSwitchTargets.set(slot, pokeName);
+      }
+      
+      // Skip if we've already seen this exact switch line in this batch
       if (seenSwitches.has(ident)) {
         continue;
       }
       seenSwitches.add(ident);
-    }
-    
-    // Skip |split| lines entirely - they're PS internal markers
-    if (line.startsWith('|split|')) {
-      continue;
     }
     
     result.push(line);
@@ -804,19 +822,30 @@ function emitMovePrompts(room: Room, state: BattleState) {
 
 // Emit force-switch prompts to players who need to switch due to fainted Pokemon
 function emitForceSwitchPrompts(room: Room, state: BattleState, needsSwitch: string[]) {
+  console.log(`[Server] emitForceSwitchPrompts called for ${needsSwitch.length} players:`, needsSwitch);
   for (const playerId of needsSwitch) {
     const playerSocket = room.players.find(p => p.id === playerId)?.socketId;
-    if (!playerSocket) continue;
+    if (!playerSocket) {
+      console.log(`[Server] emitForceSwitchPrompts: No socket found for player ${playerId}`);
+      continue;
+    }
     const sock = io.sockets.sockets.get(playerSocket);
-    if (!sock) continue;
+    if (!sock) {
+      console.log(`[Server] emitForceSwitchPrompts: Socket not connected for player ${playerId}`);
+      continue;
+    }
     
     const player = state.players.find(p => p.id === playerId);
-    if (!player) continue;
+    if (!player) {
+      console.log(`[Server] emitForceSwitchPrompts: Player not found in state for ${playerId}`);
+      continue;
+    }
     
     // Get the PS engine's native request - it has correctly ordered pokemon array
     let psRequest: any = null;
     if (room.engine instanceof SyncPSEngine) {
       psRequest = room.engine.getRequest(playerId);
+      console.log(`[Server] emitForceSwitchPrompts: Got PS request for ${playerId}:`, JSON.stringify(psRequest?.forceSwitch));
     }
     
     const sideIndex = state.players.indexOf(player);
@@ -833,6 +862,11 @@ function emitForceSwitchPrompts(room: Room, state: BattleState, needsSwitch: str
         },
       };
       
+      console.log(`[Server] emitForceSwitchPrompts: Emitting PS forceSwitch prompt to ${playerId}:`, {
+        roomId: room.id,
+        forceSwitch: switchRequest.forceSwitch,
+        sidePokemon: switchRequest.side?.pokemon?.length,
+      });
       sock.emit("promptAction", {
         roomId: room.id,
         playerId: player.id,
