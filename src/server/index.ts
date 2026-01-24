@@ -1022,7 +1022,7 @@ function clearForceSwitchTimer(room: Room) {
   room.forceSwitchDeadline = undefined;
 }
 
-// Turn timeout - auto-fill missing player actions if they don't respond in time
+// Turn timeout - disabled auto-fill, just log a warning
 // Set TURN_TIMEOUT_MS env var to customize (in milliseconds). Default is 60 seconds.
 const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 60000); // 60 seconds default
 
@@ -1036,46 +1036,15 @@ function startTurnTimer(room: Room) {
     const submitted = Object.keys(room.turnBuffer);
     if (submitted.length >= expected) return; // Already complete
     
-    // Log detailed info about who hasn't submitted
+    // Log detailed info about who hasn't submitted - but DO NOT auto-fill
     const missing = state.players.filter(p => !room.turnBuffer[p.id]).map(p => p.id);
-    console.warn(`[Server] Turn ${state.turn} timeout - auto-filling for ${missing.length} players who didn't respond: ${missing.join(', ')}`);
+    console.warn(`[Server] Turn ${state.turn} timeout - still waiting for ${missing.length} players: ${missing.join(', ')}`);
     console.warn(`[Server] Submitted: ${submitted.join(', ') || 'none'} | Missing: ${missing.join(', ')}`);
     
-    // Auto-fill for all players who haven't submitted
-    for (const player of state.players) {
-      if (room.turnBuffer[player.id]) continue;
-      
-      const active = player.team?.[player.activeIndex];
-      if (!active) continue;
-      
-      const opponent = state.players.find((p) => p.id !== player.id);
-      const opponentActive = opponent?.team?.[opponent.activeIndex];
-      
-      let autoMoveId = "default";
-      if (room.engine instanceof SyncPSEngine) {
-        const req = room.engine.getRequest(player.id) as any;
-        const reqMoveId = req?.active?.[0]?.moves?.[0]?.id as string | undefined;
-        if (reqMoveId) autoMoveId = reqMoveId;
-      } else if (active?.moves?.length) {
-        const fallbackMove = active.moves[0] as any;
-        autoMoveId = typeof fallbackMove === "string" ? fallbackMove : (fallbackMove?.id || fallbackMove?.name || "default");
-      }
-      
-      room.turnBuffer[player.id] = {
-        type: "move",
-        actorPlayerId: player.id,
-        pokemonId: active.id,
-        moveId: autoMoveId,
-        targetPlayerId: opponent?.id || "",
-        targetPokemonId: opponentActive?.id || "",
-      } as MoveAction;
-      console.warn(`[Server] Turn timeout auto-filled action for player ${player.id}: move ${autoMoveId}`);
-    }
-    
-    // Now process the turn with all actions
-    if (Object.keys(room.turnBuffer).length >= expected) {
-      processTurnWithBuffer(room);
-    }
+    // DO NOT auto-fill moves - just continue waiting
+    // The battle will only progress when all players submit their actions
+    // Restart the timer to keep checking
+    startTurnTimer(room);
   }, TURN_TIMEOUT_MS);
 }
 
@@ -1490,35 +1459,13 @@ io.on("connection", (socket: Socket) => {
     const currentState = room.engine.getState();
     const expected = currentState.players.length;
 
-    // Auto-fill missing players if they are no longer connected
+    // Log disconnected players but DO NOT auto-fill their actions
     const livePlayerIds = new Set(
       room.players.filter((p) => io.sockets.sockets.has(p.socketId)).map((p) => p.id)
     );
     const missingPlayers = currentState.players.filter((p) => !livePlayerIds.has(p.id));
-    for (const missing of missingPlayers) {
-      if (room.turnBuffer[missing.id]) continue;
-      const active = missing.team?.[missing.activeIndex];
-      if (!active) continue;
-      const opponent = currentState.players.find((p) => p.id !== missing.id);
-      const opponentActive = opponent?.team?.[opponent.activeIndex];
-      let autoMoveId = "default";
-      if (room.engine instanceof SyncPSEngine) {
-        const req = room.engine.getRequest(missing.id) as any;
-        const reqMoveId = req?.active?.[0]?.moves?.[0]?.id as string | undefined;
-        if (reqMoveId) autoMoveId = reqMoveId;
-      } else if (active?.moves?.length) {
-        const fallbackMove = active.moves[0] as any;
-        autoMoveId = typeof fallbackMove === "string" ? fallbackMove : (fallbackMove?.id || fallbackMove?.name || "default");
-      }
-      room.turnBuffer[missing.id] = {
-        type: "move",
-        actorPlayerId: missing.id,
-        pokemonId: active.id,
-        moveId: autoMoveId,
-        targetPlayerId: opponent?.id || "",
-        targetPokemonId: opponentActive?.id || "",
-      } as MoveAction;
-      console.warn(`[Server] Auto-filled action for missing player ${missing.id}: move ${autoMoveId}`);
+    if (missingPlayers.length > 0) {
+      console.warn(`[Server] Disconnected players: ${missingPlayers.map(p => p.id).join(', ')} - waiting for reconnection or timeout`);
     }
 
     console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
