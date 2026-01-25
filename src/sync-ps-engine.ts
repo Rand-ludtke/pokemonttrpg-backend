@@ -68,6 +68,10 @@ export class SyncPSEngine {
 	private format: string;
 	private lastLogIndex = 0;
 	private startSent = false; // Track if |start| has already been emitted
+	private initialProtocolComplete = false; // Track when initial start/switch/turn phase is complete
+	private seenInitialLines = new Set<string>();
+	private seenInitialSwitches = new Set<string>();
+	private seenInitialTurns = new Set<number>();
 	private rules?: any; // Battle rules/clauses
 
 	constructor(private readonly options?: { format?: string; seed?: number | number[]; rules?: any }) {
@@ -80,6 +84,14 @@ export class SyncPSEngine {
 	 * Teams should be in our Pokemon format - they will be converted to PS packed format.
 	 */
 	initializeBattle(players: Player[], options?: { seed?: number | number[] }): BattleState {
+		// Reset protocol tracking for a fresh battle
+		this.lastLogIndex = 0;
+		this.startSent = false;
+		this.initialProtocolComplete = false;
+		this.seenInitialLines.clear();
+		this.seenInitialSwitches.clear();
+		this.seenInitialTurns.clear();
+
 		const seed = options?.seed || this.options?.seed;
 		const seedArray = Array.isArray(seed) ? seed : seed ? [seed, seed, seed, seed] : PRNG.generateSeed();
 
@@ -404,6 +416,15 @@ export class SyncPSEngine {
 			let seenTurnInBlock = false;
 			
 			for (const entry of slice) {
+				// Mark initial protocol complete when we see real action lines or later turns
+				if (!this.initialProtocolComplete) {
+					const actionLine = this.isActionProtocolLine(entry);
+					const turnNum = this.extractTurnNumber(entry);
+					if (actionLine || (typeof turnNum === "number" && turnNum >= 2)) {
+						this.initialProtocolComplete = true;
+					}
+				}
+
 				// If we see |start| and we've already sent start, skip this block
 				if (entry === "|start" || entry.startsWith("|start|")) {
 					if (this.startSent) {
@@ -431,6 +452,27 @@ export class SyncPSEngine {
 					}
 				}
 				
+				// During initial protocol phase, aggressively dedupe setup/switch/turn lines
+				if (!this.initialProtocolComplete && this.isInitialProtocolLine(entry)) {
+					const switchKey = this.extractSwitchKey(entry);
+					const turnNum = this.extractTurnNumber(entry);
+					if (switchKey) {
+						if (this.seenInitialSwitches.has(switchKey)) {
+							continue;
+						}
+						this.seenInitialSwitches.add(switchKey);
+					} else if (typeof turnNum === "number") {
+						if (this.seenInitialTurns.has(turnNum)) {
+							continue;
+						}
+						this.seenInitialTurns.add(turnNum);
+					} else if (this.seenInitialLines.has(entry)) {
+						continue;
+					} else {
+						this.seenInitialLines.add(entry);
+					}
+				}
+
 				this.state.log.push(entry);
 				newEntries.push(entry);
 			}
@@ -438,6 +480,59 @@ export class SyncPSEngine {
 		}
 		
 		return newEntries;
+	}
+
+	private isInitialProtocolLine(line: string): boolean {
+		return (
+			line === "|" ||
+			line.startsWith("|t:|") ||
+			line.startsWith("|gametype|") ||
+			line.startsWith("|player|") ||
+			line.startsWith("|teamsize|") ||
+			line.startsWith("|gen|") ||
+			line.startsWith("|tier|") ||
+			line.startsWith("|clearpoke") ||
+			line.startsWith("|poke|") ||
+			line.startsWith("|teampreview") ||
+			line.startsWith("|start") ||
+			line.startsWith("|split|") ||
+			line.startsWith("|switch|") ||
+			line.startsWith("|drag|") ||
+			line.startsWith("|replace|") ||
+			line.startsWith("|turn|")
+		);
+	}
+
+	private isActionProtocolLine(line: string): boolean {
+		return (
+			line.startsWith("|move|") ||
+			line.startsWith("|cant|") ||
+			line.startsWith("|-damage|") ||
+			line.startsWith("|damage|") ||
+			line.startsWith("|-heal|") ||
+			line.startsWith("|heal|") ||
+			line.startsWith("|faint|")
+		);
+	}
+
+	private extractTurnNumber(line: string): number | null {
+		if (!line.startsWith("|turn|")) return null;
+		const parts = line.split("|");
+		const num = parseInt(parts[2] || "", 10);
+		return Number.isFinite(num) ? num : null;
+	}
+
+	private extractSwitchKey(line: string): string | null {
+		if (!line.startsWith("|switch|") && !line.startsWith("|drag|") && !line.startsWith("|replace|")) {
+			return null;
+		}
+		const parts = line.split("|");
+		const ident = parts[2] || "";
+		const match = ident.match(/^(p[12][a-z]?):\s*(.+)$/);
+		if (!match) return null;
+		const slot = match[1];
+		const name = match[2];
+		return `${slot}:${String(name).toLowerCase().trim()}`;
 	}
 
 	/**
