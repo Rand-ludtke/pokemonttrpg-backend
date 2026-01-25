@@ -345,7 +345,11 @@ export class SyncPSEngine {
 	 */
 	private hasUnlimitedTeraClause(): boolean {
 		const clauses = this.rules?.clauses;
-		const hasClause = Array.isArray(clauses) && clauses.includes('unlimitedtera');
+		const clauseList = Array.isArray(clauses)
+			? clauses.map((c: any) => String(c).toLowerCase())
+			: (typeof clauses === 'string' ? clauses.split(/\s*,\s*/) : []);
+		const customRules = String(this.rules?.customRules || this.rules?.displayString || '').toLowerCase();
+		const hasClause = clauseList.includes('unlimitedtera') || customRules.includes('unlimitedtera');
 		console.log(`[SyncPSEngine] hasUnlimitedTeraClause check: rules=${JSON.stringify(this.rules)}, clauses=${JSON.stringify(clauses)}, result=${hasClause}`);
 		return hasClause;
 	}
@@ -358,6 +362,13 @@ export class SyncPSEngine {
 		console.log('[SyncPSEngine] resetTerastallizeForAll called - re-enabling tera for all Pokemon');
 		let resetCount = 0;
 		for (const side of this.battle.sides) {
+			// Reset side-level tera flags so another Pokemon can terastallize
+			if (side && typeof (side as any).canTerastallize !== 'undefined') {
+				(side as any).canTerastallize = true;
+			}
+			if (side && typeof (side as any).teraUsed !== 'undefined') {
+				(side as any).teraUsed = false;
+			}
 			for (const pokemon of (side as any).pokemon || []) {
 				// Only re-enable if the Pokemon has a tera type and hasn't already terastallized this turn
 				if (pokemon.teraType && !pokemon.terastallized) {
@@ -652,6 +663,12 @@ export class SyncPSEngine {
 				} else if (psMon.fainted) {
 					ourMon.status = "none";
 					ourMon.currentHP = 0;
+				}
+
+				// Sync ability (handles mega evolution and Trace/ability changes)
+				const abilityId = psMon.ability || psMon.baseAbility;
+				if (abilityId) {
+					ourMon.ability = String(abilityId);
 				}
 
 				// Update stages/boosts - check if this is the active pokemon
