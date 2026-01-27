@@ -20,7 +20,10 @@ class SyncPSEngine {
         this.battle = null;
         this.playerIdToSide = new Map();
         this.sideToPlayerId = new Map();
+        this.lastLogIndex = 0;
+        this.startSent = false; // Track if |start| has already been emitted
         this.format = options?.format || "gen9customgame";
+        this.rules = options?.rules;
     }
     /**
      * Initialize a battle with the given players.
@@ -37,12 +40,16 @@ class SyncPSEngine {
         // Convert our teams to PS packed format
         const p1Team = this.convertTeamToPacked(players[0].team);
         const p2Team = this.convertTeamToPacked(players[1].team);
+        // Extract avatar/trainerSprite for PS protocol
+        // IMPORTANT: Default to 'acetrainer' not empty string - PS client calls rollTrainerSprites() if avatar is falsy
+        const p1Avatar = players[0].trainerSprite || players[0].avatar || "acetrainer";
+        const p2Avatar = players[1].trainerSprite || players[1].avatar || "acetrainer";
         // Create the battle directly (synchronous)
         this.battle = new PSBattle({
             formatid: this.format,
             seed: seedArray,
-            p1: { name: players[0].name, team: p1Team },
-            p2: { name: players[1].name, team: p2Team },
+            p1: { name: players[0].name, avatar: p1Avatar, team: p1Team },
+            p2: { name: players[1].name, avatar: p2Avatar, team: p2Team },
         });
         // Initialize our state mirror
         this.state = {
@@ -62,8 +69,41 @@ class SyncPSEngine {
             log: [],
             coinFlipWinner: undefined,
         };
+        // Start the battle if the simulator exposes start()
+        if (this.battle && typeof this.battle.start === "function") {
+            const alreadyStarted = this.battle.started || this.battle.turn > 0;
+            if (!alreadyStarted) {
+                try {
+                    this.battle.start();
+                }
+                catch (err) {
+                    const msg = String(err?.message || err || "");
+                    if (!/already started/i.test(msg)) {
+                        throw err;
+                    }
+                }
+            }
+        }
         // Sync initial state
         this.syncStateFromPS();
+        // Auto-complete Team Preview if needed (server handles ordering before this)
+        if (this.battle) {
+            const p1 = this.battle.p1;
+            const p2 = this.battle.p2;
+            const p1TeamSize = this.state.players?.[0]?.team?.length || 6;
+            const p2TeamSize = this.state.players?.[1]?.team?.length || 6;
+            const buildTeamOrder = (size) => `team ${Array.from({ length: size }, (_v, i) => i + 1).join("")}`;
+            if (p1?.request?.teamPreview) {
+                this.battle.choose("p1", buildTeamOrder(p1TeamSize));
+            }
+            if (p2?.request?.teamPreview) {
+                this.battle.choose("p2", buildTeamOrder(p2TeamSize));
+            }
+            // Re-sync state in case turn advanced
+            this.syncStateFromPS();
+        }
+        // Capture initial PS log entries (setup, switch-ins, turn start)
+        this.collectNewLogEntries();
         return this.state;
     }
     /**
@@ -76,12 +116,13 @@ class SyncPSEngine {
             item: mon.item || "",
             ability: mon.ability || "",
             moves: mon.moves.map((m) => m.name || m.id),
-            nature: "Hardy",
-            evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
-            ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+            nature: mon.nature || "Hardy",
+            evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, ...mon.evs },
+            ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31, ...mon.ivs },
             level: mon.level,
-            shiny: false,
-            gender: "",
+            shiny: !!mon.shiny,
+            gender: mon.gender || "",
+            teraType: mon.teraType || "",
         }));
         return Teams.pack(sets);
     }
@@ -96,6 +137,33 @@ class SyncPSEngine {
             return null;
         const psSide = this.battle.sides.find((s) => s.id === side);
         return psSide?.activeRequest || null;
+    }
+    /**
+     * Get the active Pokemon's moves with current PP directly from PS engine
+     * This is useful as a fallback when activeRequest is not available
+     */
+    getActiveMovesPP(playerId) {
+        if (!this.battle)
+            return null;
+        const side = this.playerIdToSide.get(playerId);
+        if (!side)
+            return null;
+        const psSide = this.battle.sides.find((s) => s.id === side);
+        if (!psSide)
+            return null;
+        const activePokemon = psSide.active?.[0];
+        if (!activePokemon)
+            return null;
+        // PS stores move data in moveSlots array
+        const moveSlots = activePokemon.moveSlots || activePokemon.baseMoveSlots || [];
+        return moveSlots.map((slot) => ({
+            id: slot.id || slot.move?.toLowerCase().replace(/[^a-z0-9]/g, '') || '',
+            name: slot.move || slot.name || '',
+            pp: slot.pp ?? slot.maxpp ?? 10,
+            maxpp: slot.maxpp ?? 10,
+            target: slot.target || 'normal',
+            disabled: slot.disabled || false,
+        }));
     }
     /**
      * Check if a player needs to make a force switch
@@ -140,6 +208,7 @@ class SyncPSEngine {
         }
         const events = [];
         const anim = [];
+        const prevTurn = this.state.turn;
         // Group actions by player
         const actionsByPlayer = new Map();
         for (const action of actions) {
@@ -152,6 +221,7 @@ class SyncPSEngine {
                 continue;
             const choice = this.actionToChoice(action, side);
             if (choice) {
+                console.log(`[DIAG-PROTOCOL] [engine] choose side=${side} player=${playerId} choice=${choice}`);
                 const success = this.battle.choose(side, choice);
                 if (!success) {
                     console.error(`[SyncPSEngine] Choice failed for ${side}: ${choice}`);
@@ -160,27 +230,115 @@ class SyncPSEngine {
                 }
             }
         }
+        // Ensure decisions are committed if the simulator didn't advance the turn
+        if (this.battle && typeof this.battle.commitDecisions === "function") {
+            if (this.battle.turn === prevTurn) {
+                console.log(`[DIAG-PROTOCOL] [engine] commitDecisions (turn=${this.battle.turn}, prev=${prevTurn})`);
+                try {
+                    this.battle.commitDecisions();
+                }
+                catch (err) {
+                    console.error(`[SyncPSEngine] commitDecisions failed:`, err?.stack || err);
+                }
+            }
+        }
         // Collect log entries after the turn processes
         events.push(...this.collectNewLogEntries());
+        if (events.length > 0) {
+            const hasStart = events.some((l) => l === "|start" || l.startsWith("|start|"));
+            const hasTurn = events.some((l) => l.startsWith("|turn|"));
+            const sample = events.slice(0, 8);
+            console.log(`[DIAG-PROTOCOL] [engine] turn=${this.battle.turn} events=${events.length} start=${hasStart} turnLine=${hasTurn} sample=${JSON.stringify(sample)}`);
+        }
         anim.push(...this.parseLogToAnimations(events));
         // Update our state
         this.syncStateFromPS();
         this.state.turn = this.battle.turn;
+        // If Unlimited Terastallization clause is enabled, re-enable canTerastallize for all Pokemon after each turn
+        if (this.hasUnlimitedTeraClause()) {
+            this.resetTerastallizeForAll();
+        }
         return { state: this.state, events, anim };
     }
     /**
+     * Check if the unlimited terastallization clause is enabled
+     */
+    hasUnlimitedTeraClause() {
+        const clauses = this.rules?.clauses;
+        const hasClause = Array.isArray(clauses) && clauses.includes('unlimitedtera');
+        console.log(`[SyncPSEngine] hasUnlimitedTeraClause check: rules=${JSON.stringify(this.rules)}, clauses=${JSON.stringify(clauses)}, result=${hasClause}`);
+        return hasClause;
+    }
+    /**
+     * Re-enable canTerastallize for all Pokemon (for unlimited tera clause)
+     */
+    resetTerastallizeForAll() {
+        if (!this.battle)
+            return;
+        console.log('[SyncPSEngine] resetTerastallizeForAll called - re-enabling tera for all Pokemon');
+        let resetCount = 0;
+        for (const side of this.battle.sides) {
+            for (const pokemon of side.pokemon || []) {
+                // Only re-enable if the Pokemon has a tera type and hasn't already terastallized this turn
+                if (pokemon.teraType && !pokemon.terastallized) {
+                    pokemon.canTerastallize = pokemon.teraType;
+                    resetCount++;
+                    console.log(`[SyncPSEngine] Reset canTerastallize for ${pokemon.name || pokemon.species}: teraType=${pokemon.teraType}`);
+                }
+            }
+        }
+        console.log(`[SyncPSEngine] resetTerastallizeForAll complete - reset ${resetCount} Pokemon`);
+    }
+    /**
      * Collect new log entries from PS battle
+     * Filters out duplicate |start| blocks that PS may generate
      */
     collectNewLogEntries() {
         if (!this.battle)
             return [];
         const log = this.battle.log || [];
         const newEntries = [];
-        for (const entry of log) {
-            if (!this.state.log.includes(entry)) {
+        // If the battle log was reset, rewind our cursor.
+        if (this.lastLogIndex > log.length) {
+            this.lastLogIndex = 0;
+        }
+        if (log.length > this.lastLogIndex) {
+            const slice = log.slice(this.lastLogIndex);
+            // Track if we see a duplicate |start| block
+            let inDuplicateStartBlock = false;
+            let seenTurnInBlock = false;
+            for (const entry of slice) {
+                // If we see |start| and we've already sent start, skip this block
+                if (entry === "|start" || entry.startsWith("|start|")) {
+                    if (this.startSent) {
+                        inDuplicateStartBlock = true;
+                        seenTurnInBlock = false;
+                        console.log(`[SyncPSEngine] Skipping duplicate |start| block`);
+                        continue;
+                    }
+                    else {
+                        this.startSent = true;
+                    }
+                }
+                // If we're in a duplicate start block, skip until we see |turn|
+                // Then skip the duplicate |turn| too
+                if (inDuplicateStartBlock) {
+                    if (entry.startsWith("|turn|")) {
+                        if (!seenTurnInBlock) {
+                            seenTurnInBlock = true;
+                            continue; // Skip the duplicate turn line
+                        }
+                        // Second turn line means we're past the duplicate block
+                        inDuplicateStartBlock = false;
+                    }
+                    else {
+                        continue; // Skip lines in duplicate start block
+                    }
+                }
                 this.state.log.push(entry);
                 newEntries.push(entry);
             }
+            this.lastLogIndex = log.length;
         }
         return newEntries;
     }
@@ -298,8 +456,20 @@ class SyncPSEngine {
     actionToChoice(action, side) {
         if (action.type === "move") {
             const moveAction = action;
+            if (!moveAction.moveId || moveAction.moveId === "default") {
+                return "default";
+            }
             const moveIndex = this.findMoveIndex(moveAction.moveId, side);
-            return `move ${moveIndex}`;
+            let choice = `move ${moveIndex}`;
+            if (moveAction.mega)
+                choice += " mega";
+            if (moveAction.zmove)
+                choice += " zmove";
+            if (moveAction.dynamax)
+                choice += " dynamax";
+            if (moveAction.terastallize)
+                choice += " terastallize";
+            return choice;
         }
         if (action.type === "switch") {
             const switchAction = action;
@@ -385,18 +555,35 @@ class SyncPSEngine {
                     ourMon.status = "none";
                     ourMon.currentHP = 0;
                 }
-                // Update stages/boosts
-                if (psMon.boosts) {
+                // Update stages/boosts - check if this is the active pokemon
+                // In PS, boosts are on the active pokemon object (psSide.active[0])
+                // which may or may not be the same reference as psSide.pokemon[i]
+                const isActive = activePokemon && (psMon === activePokemon ||
+                    psMon.position === activePokemon.position ||
+                    (psMon.speciesState?.id === activePokemon.speciesState?.id && psMon.name === activePokemon.name));
+                // Get boosts from the appropriate source
+                const boostSource = isActive && activePokemon?.boosts ? activePokemon.boosts : psMon.boosts;
+                if (boostSource) {
                     ourMon.stages = {
                         hp: 0,
-                        atk: psMon.boosts.atk || 0,
-                        def: psMon.boosts.def || 0,
-                        spa: psMon.boosts.spa || 0,
-                        spd: psMon.boosts.spd || 0,
-                        spe: psMon.boosts.spe || 0,
-                        acc: psMon.boosts.accuracy || 0,
-                        eva: psMon.boosts.evasion || 0,
+                        atk: boostSource.atk || 0,
+                        def: boostSource.def || 0,
+                        spa: boostSource.spa || 0,
+                        spd: boostSource.spd || 0,
+                        spe: boostSource.spe || 0,
+                        acc: boostSource.accuracy || 0,
+                        eva: boostSource.evasion || 0,
                     };
+                    // Debug logging for boost sync
+                    if (isActive && (boostSource.atk || boostSource.def || boostSource.spa || boostSource.spd || boostSource.spe)) {
+                        console.log(`[SyncPSEngine] Active pokemon ${ourMon.name} boosts synced:`, {
+                            atk: boostSource.atk || 0,
+                            def: boostSource.def || 0,
+                            spa: boostSource.spa || 0,
+                            spd: boostSource.spd || 0,
+                            spe: boostSource.spe || 0,
+                        });
+                    }
                 }
             }
         }

@@ -70,6 +70,7 @@ function createRoomRecord(id, name) {
         spectators: [],
         engine: undefined,
         battleStarted: false,
+        startProtocolSent: false,
         turnBuffer: {},
         replay: [],
         phase: "normal",
@@ -79,7 +80,10 @@ function createRoomRecord(id, name) {
         forceSwitchNeeded: new Set(),
         forceSwitchTimer: undefined,
         forceSwitchDeadline: undefined,
+        turnTimer: undefined,
+        turnDeadline: undefined,
         challenges: new Map(),
+        lastPromptByPlayer: {},
     };
 }
 function challengeSummary(ch) {
@@ -264,6 +268,12 @@ app.get("/api/rooms/:id/snapshot", (req, res) => {
 });
 const server = http_1.default.createServer(app);
 const io = new socket_io_1.Server(server, { cors: { origin: "*" } });
+process.on("uncaughtException", (err) => {
+    console.error("[Server] Uncaught exception:", err?.stack || err);
+});
+process.on("unhandledRejection", (err) => {
+    console.error("[Server] Unhandled rejection:", err);
+});
 function emitChallengeCreated(room, challenge) {
     io.to(room.id).emit("challengeCreated", { roomId: room.id, challenge: challengeSummary(challenge) });
 }
@@ -273,12 +283,35 @@ function emitChallengeUpdated(room, challenge) {
 function emitChallengeRemoved(room, challengeId, reason) {
     io.to(room.id).emit("challengeRemoved", { roomId: room.id, challengeId, reason });
 }
+function coerceTrainerSprite(value) {
+    let raw;
+    if (typeof value === "string") {
+        raw = value.trim();
+    }
+    else if (typeof value === "number" && Number.isFinite(value)) {
+        raw = String(Math.trunc(value));
+    }
+    if (!raw)
+        return undefined;
+    // Normalize: lowercase, remove spaces/special chars
+    const normalized = raw.toLowerCase().replace(/[\s_-]+/g, "").replace(/[^a-z0-9]/gi, "");
+    // Filter out invalid/placeholder values
+    const invalid = ["pending", "random", "default", "unknown", "none", ""];
+    if (invalid.includes(normalized))
+        return undefined;
+    return raw;
+}
 function sanitizePlayerPayload(player, participant) {
     const clone = JSON.parse(JSON.stringify(player));
+    const cloneAny = clone;
+    const trainerSprite = coerceTrainerSprite(cloneAny.trainerSprite ?? cloneAny.avatar ?? participant.trainerSprite);
     clone.id = participant.playerId;
     clone.name = clone.name || participant.username;
     if (typeof clone.activeIndex !== "number")
         clone.activeIndex = 0;
+    // Always set/clear trainerSprite and avatar to ensure invalid values are removed
+    cloneAny.trainerSprite = trainerSprite || undefined;
+    cloneAny.avatar = trainerSprite || undefined;
     return clone;
 }
 function startTeamPreview(room, players, rules) {
@@ -331,15 +364,21 @@ function startTeamPreview(room, players, rules) {
                 players: players.map((p, pIdx) => ({
                     id: p.id,
                     name: p.name || p.id,
+                    trainerSprite: p.trainerSprite,
+                    avatar: p.avatar ?? p.trainerSprite,
                     activeIndex: 0,
                     team: p.team.map((mon) => ({
                         id: mon.id,
                         pokemonId: mon.id,
-                        name: mon.name || mon.species,
-                        species: mon.species,
+                        // Use mon.name as the species (in our type system, 'name' IS the species, 'nickname' is for display)
+                        name: mon.nickname || mon.name || mon.species,
+                        species: mon.species || mon.name, // Ensure species is always set
                         nickname: mon.nickname,
                         level: mon.level || 50,
                         types: mon.types,
+                        gender: mon.gender,
+                        shiny: mon.shiny,
+                        item: mon.item,
                     })),
                 })),
             },
@@ -391,51 +430,86 @@ function checkTeamPreviewComplete(room) {
     beginBattle(room, orderedPlayers, rules?.seed);
 }
 function beginBattle(room, players, seed, rules) {
-    // Check if team preview is enabled
-    if (rules?.teamPreview && room.phase !== "team-preview") {
-        startTeamPreview(room, players, rules);
-        return;
-    }
-    const battleSeed = seed ?? 123;
-    // Use Pokemon Showdown engine or custom engine based on configuration
-    if (USE_PS_ENGINE) {
-        console.log(`[Server] Using Pokemon Showdown battle engine`);
-        room.engine = new sync_ps_engine_1.default({ format: "gen9customgame", seed: battleSeed });
-    }
-    else {
-        console.log(`[Server] Using custom battle engine`);
-        room.engine = new engine_1.default({ seed: battleSeed });
-    }
-    room.turnBuffer = {};
-    room.replay = [];
-    clearForceSwitchTimer(room);
-    const state = room.engine.initializeBattle(players, { seed: battleSeed });
-    if (typeof state.turn === "number" && state.turn < 1) {
-        state.turn = 1;
-    }
-    room.battleStarted = true;
-    room.phase = "normal";
-    room.forceSwitchNeeded = new Set();
-    console.log(`[Server] Emitting battleStarted for room ${room.id}`);
-    io.to(room.id).emit("battleStarted", { roomId: room.id, state });
-    const initialEvents = buildInitialBattleProtocol(state);
-    if (initialEvents.length > 0) {
-        if (Array.isArray(state.log)) {
-            for (const line of initialEvents) {
-                if (!state.log.includes(line))
-                    state.log.push(line);
+    try {
+        // Check if team preview is enabled
+        if (rules?.teamPreview && room.phase !== "team-preview") {
+            startTeamPreview(room, players, rules);
+            return;
+        }
+        const battleSeed = Number.isFinite(seed) ? seed : undefined;
+        // Use Pokemon Showdown engine or custom engine based on configuration
+        if (USE_PS_ENGINE) {
+            console.log(`[Server] Using Pokemon Showdown battle engine with rules:`, JSON.stringify(rules));
+            room.engine = new sync_ps_engine_1.default({ format: "gen9customgame", seed: battleSeed, rules });
+        }
+        else {
+            console.log(`[Server] Using custom battle engine`);
+            room.engine = new engine_1.default({ seed: battleSeed });
+        }
+        room.turnBuffer = {};
+        room.replay = [];
+        clearForceSwitchTimer(room);
+        const hydratedPlayers = players.map((player) => {
+            const clone = JSON.parse(JSON.stringify(player));
+            const roomPlayer = room.players.find((p) => p.id === player.id);
+            const trainerSprite = coerceTrainerSprite(clone.trainerSprite ?? clone.avatar ?? roomPlayer?.trainerSprite);
+            // Always set/clear trainerSprite and avatar to ensure invalid values are removed
+            clone.trainerSprite = trainerSprite || undefined;
+            clone.avatar = trainerSprite || undefined;
+            return clone;
+        });
+        const state = room.engine.initializeBattle(hydratedPlayers, { seed: battleSeed });
+        // Ensure clients treat this as turn 1 when prompting (no pre-start move UI)
+        if (typeof state.turn === "number" && state.turn < 1) {
+            state.turn = 1;
+        }
+        room.battleStarted = true;
+        room.phase = "normal";
+        room.forceSwitchNeeded = new Set();
+        console.log(`[Server] Emitting battleStarted for room ${room.id}`);
+        io.to(room.id).emit("battleStarted", { roomId: room.id, state });
+        // Emit initial protocol events (|start|, |switch|, |turn|1) before prompting for moves
+        // This prevents a pre-start move prompt from showing before the battle is visually started.
+        // ONLY do this if the engine hasn't already generated start events (SyncPSEngine now does)
+        const hasStart = Array.isArray(state.log) && state.log.some((l) => l.startsWith("|start"));
+        if (hasStart)
+            room.startProtocolSent = true;
+        if (!hasStart) {
+            const initialEvents = buildInitialBattleProtocol(state);
+            if (initialEvents.length > 0) {
+                // Append to state.log so SyncPSEngine won't re-send these lines later
+                if (Array.isArray(state.log)) {
+                    for (const line of initialEvents) {
+                        if (!state.log.includes(line))
+                            state.log.push(line);
+                    }
+                }
+                room.startProtocolSent = true;
+                io.to(room.id).emit("battleUpdate", {
+                    result: { state, events: initialEvents, anim: [] },
+                    needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
+                });
             }
         }
-        io.to(room.id).emit("battleUpdate", {
-            result: { state, events: initialEvents, anim: [] },
-            needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
+        // Emit move prompts to each player so they can choose their first action
+        emitMovePrompts(room, state);
+    }
+    catch (err) {
+        console.error(`[Server] beginBattle failed for room ${room.id}:`, err?.stack || err);
+        room.engine = undefined;
+        room.battleStarted = false;
+        room.startProtocolSent = false;
+        room.phase = "normal";
+        room.turnBuffer = {};
+        room.forceSwitchNeeded = new Set();
+        io.to(room.id).emit("battleStartError", {
+            roomId: room.id,
+            message: err?.message || "Failed to start battle",
         });
     }
-    // Emit move prompts to each player so they can choose their first action
-    emitMovePrompts(room, state);
 }
 function buildInitialBattleProtocol(state) {
-    if (!(state?.players?.length))
+    if (!state?.players?.length)
         return [];
     const lines = [];
     lines.push("|start");
@@ -449,29 +523,90 @@ function buildInitialBattleProtocol(state) {
         const species = activePoke.species || activePoke.name;
         const level = activePoke.level || 100;
         const gender = activePoke.gender === "M" ? ", M" : (activePoke.gender === "F" ? ", F" : "");
+        const shiny = activePoke.shiny ? ", shiny" : "";
         const hp = activePoke.currentHP ?? activePoke.maxHP ?? 100;
         const maxHP = activePoke.maxHP ?? 100;
-        const details = `${species}, L${level}${gender}`;
+        const details = `${species}, L${level}${gender}${shiny}`;
         lines.push(`|switch|${side}a: ${nickname}|${details}|${hp}/${maxHP}`);
     });
     const turn = state.turn || 1;
     lines.push(`|turn|${turn}`);
     return lines;
 }
+// Deduplicate consecutive identical switch/drag lines (PS protocol sends private + public copies)
+// Also deduplicate repeated switch events for the same slot within the same turn batch
+function deduplicateSwitchLines(events) {
+    const result = [];
+    const seenSwitches = new Set();
+    const seenSwitchTargets = new Map(); // slot -> pokemon name
+    for (let i = 0; i < events.length; i++) {
+        const line = events[i];
+        // Skip |split| lines entirely - they're PS internal markers
+        if (line.startsWith('|split|')) {
+            continue;
+        }
+        // Check if this is a switch/drag line
+        if (line.startsWith('|switch|') || line.startsWith('|drag|') || line.startsWith('|replace|')) {
+            // Extract just the identity part (e.g., "p1a: Typhlosion") to compare
+            const parts = line.split('|');
+            const ident = parts[2] || ''; // e.g., "p1a: Typhlosion"
+            // Extract slot (e.g., "p1a") and pokemon name from ident
+            const identMatch = ident.match(/^(p[12][a-z]?):\s*(.+)$/);
+            if (identMatch) {
+                const slot = identMatch[1];
+                const pokeName = identMatch[2].trim();
+                // Skip if we've already seen a switch to this SAME Pokemon on this SAME slot
+                // (This catches duplicate switch events like "Go! Charizard!" appearing twice)
+                const prevPoke = seenSwitchTargets.get(slot);
+                if (prevPoke && prevPoke.toLowerCase() === pokeName.toLowerCase()) {
+                    console.log(`[deduplicateSwitchLines] Skipping duplicate switch: ${slot} -> ${pokeName}`);
+                    continue;
+                }
+                seenSwitchTargets.set(slot, pokeName);
+            }
+            // Skip if we've already seen this exact switch line in this batch
+            if (seenSwitches.has(ident)) {
+                continue;
+            }
+            seenSwitches.add(ident);
+        }
+        result.push(line);
+    }
+    return result;
+}
 // Emit move prompts to all players in a battle
 function emitMovePrompts(room, state) {
     if (!room.engine)
         return;
+    const turn = state.turn || 1;
+    if (!room.lastPromptByPlayer)
+        room.lastPromptByPlayer = {};
+    // Start turn timer when prompts are sent (if not already in a waiting state)
+    if (Object.keys(room.turnBuffer).length === 0) {
+        startTurnTimer(room);
+        console.log(`[Server] Turn timer started for room ${room.id} turn ${turn} (${TURN_TIMEOUT_MS}ms)`);
+    }
+    const promptedPlayers = [];
+    const skippedPlayers = [];
     for (const player of state.players) {
-        const playerSocket = room.players.find(p => p.id === player.id)?.socketId;
-        if (!playerSocket)
+        const candidateSockets = room.players.filter((p) => p.id === player.id).map((p) => p.socketId);
+        const playerSocket = candidateSockets.find((id) => io.sockets.sockets.has(id));
+        if (!playerSocket) {
+            skippedPlayers.push({ id: player.id, reason: "no valid socket" });
             continue;
+        }
         const sock = io.sockets.sockets.get(playerSocket);
-        if (!sock)
+        if (!sock) {
+            skippedPlayers.push({ id: player.id, reason: "socket not found" });
             continue;
+        }
         const active = player.team[player.activeIndex];
-        if (!active || active.currentHP <= 0)
+        if (!active || active.currentHP <= 0) {
+            skippedPlayers.push({ id: player.id, reason: "active fainted" });
             continue;
+        }
+        const alreadyActed = !!room.turnBuffer[player.id];
+        promptedPlayers.push(player.id);
         // Get the PS engine's native request - this has the correct pokemon array ordering
         // PS reorders the pokemon array after switches so active is always at index 0
         let psRequest = null;
@@ -483,91 +618,140 @@ function emitMovePrompts(room, state) {
         // If we have a PS request, use it directly - it has correct array ordering and PP
         if (psRequest && psRequest.side) {
             // PS request already has the correct format, just add our extra fields
-            const moveRequest = {
-                ...psRequest,
-                requestType: psRequest.requestType || 'move',
+            const baseSide = {
+                ...psRequest.side,
                 playerId: player.id,
-                rqid: psRequest.rqid || Date.now(),
-                // Ensure side has our player ID for reference
-                side: {
-                    ...psRequest.side,
-                    playerId: player.id,
-                },
             };
+            const promptType = alreadyActed ? "wait" : "move";
+            const lastPrompt = room.lastPromptByPlayer[player.id];
+            if (lastPrompt && lastPrompt.turn === turn && lastPrompt.type === promptType) {
+                continue;
+            }
+            const prompt = alreadyActed
+                ? { wait: true, side: baseSide, rqid: psRequest.rqid || Date.now() }
+                : {
+                    ...psRequest,
+                    requestType: psRequest.requestType || "move",
+                    playerId: player.id,
+                    rqid: psRequest.rqid || Date.now(),
+                    // Ensure side has our player ID for reference
+                    side: baseSide,
+                };
             sock.emit("promptAction", {
                 roomId: room.id,
                 playerId: player.id,
-                prompt: moveRequest,
+                prompt,
                 state: state,
             });
+            room.lastPromptByPlayer[player.id] = {
+                turn,
+                type: promptType,
+                rqid: prompt.rqid,
+            };
             continue;
         }
         // Fallback: Build request manually if PS request not available
         // Note: This won't have the correct pokemon ordering after switches
         const psActiveMoves = psRequest?.active?.[0]?.moves || [];
-        const moveRequest = {
-            requestType: 'move',
-            side: {
-                id: sideId,
-                name: player.name || player.id,
-                playerId: player.id,
-                pokemon: player.team.map((p, idx) => ({
-                    id: p.id,
-                    pokemonId: p.id,
-                    ident: `${sideId}: ${p.name}`,
-                    details: `${p.species}, L${p.level}`,
-                    condition: p.currentHP <= 0 ? '0 fnt' : `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
-                    active: idx === player.activeIndex,
-                    stats: p.stats,
-                    moves: (p.moves || []).map((m) => typeof m === 'string' ? m : m.id || m.name),
-                    baseAbility: p.ability,
-                    item: p.item || '',
-                    pokeball: 'pokeball',
-                    ability: p.ability,
-                    fainted: p.currentHP <= 0,
-                })),
-            },
+        // Also try to get PP data directly from PS engine as a backup
+        let engineMovesPP = null;
+        if (room.engine instanceof sync_ps_engine_1.default && psActiveMoves.length === 0) {
+            engineMovesPP = room.engine.getActiveMovesPP(player.id);
+            console.log(`[Server] Using engineMovesPP fallback for ${player.id}:`, engineMovesPP);
+        }
+        const sidePayload = {
+            id: sideId,
+            name: player.name || player.id,
             playerId: player.id,
-            rqid: Date.now(),
-            active: [{
-                    moves: (active.moves || []).map((move, idx) => {
-                        const moveId = typeof move === 'string' ? move : move.id || move.name || `move${idx}`;
-                        const psMove = psActiveMoves.find((m) => m.id === moveId || m.id === moveId.toLowerCase().replace(/\s/g, ''));
-                        return {
-                            move: typeof move === 'string' ? move : move.name || move.id || `Move ${idx + 1}`,
-                            id: moveId.toLowerCase().replace(/\s/g, ''),
-                            pp: psMove?.pp ?? (active.volatile?.pp?.[moveId] ?? move.pp ?? 10),
-                            maxpp: psMove?.maxpp ?? move.maxpp ?? move.pp ?? 10,
-                            target: psMove?.target || move.target || 'normal',
-                            disabled: psMove?.disabled || move.disabled || false,
-                        };
-                    }),
-                }],
+            pokemon: player.team.map((p, idx) => ({
+                id: p.id,
+                pokemonId: p.id,
+                ident: `${sideId}: ${p.name}`,
+                details: `${p.species}, L${p.level}`,
+                condition: p.currentHP <= 0 ? '0 fnt' : `${p.currentHP}/${p.stats?.hp || p.maxHP || 100}`,
+                active: idx === player.activeIndex,
+                stats: p.stats,
+                moves: (p.moves || []).map((m) => typeof m === 'string' ? m : m.id || m.name),
+                baseAbility: p.ability,
+                item: p.item || '',
+                pokeball: 'pokeball',
+                ability: p.ability,
+                fainted: p.currentHP <= 0,
+            })),
         };
+        const promptType = alreadyActed ? "wait" : "move";
+        const lastPrompt = room.lastPromptByPlayer[player.id];
+        if (lastPrompt && lastPrompt.turn === turn && lastPrompt.type === promptType) {
+            continue;
+        }
+        const prompt = alreadyActed
+            ? { wait: true, side: sidePayload, rqid: Date.now() }
+            : {
+                requestType: "move",
+                side: sidePayload,
+                playerId: player.id,
+                rqid: Date.now(),
+                active: [{
+                        moves: (active.moves || []).map((move, idx) => {
+                            const moveId = typeof move === "string" ? move : move.id || move.name || `move${idx}`;
+                            const normalizedMoveId = moveId.toLowerCase().replace(/[^a-z0-9]/g, "");
+                            // Try to find PP from multiple sources:
+                            // 1. psActiveMoves from activeRequest
+                            // 2. engineMovesPP from direct PS engine query
+                            // 3. Fall back to defaults
+                            const psMove = psActiveMoves.find((m) => m.id === normalizedMoveId || m.id === moveId);
+                            const engineMove = engineMovesPP?.find((m) => m.id === normalizedMoveId || m.id === moveId);
+                            const pp = psMove?.pp ?? engineMove?.pp ?? move.pp ?? 10;
+                            const maxpp = psMove?.maxpp ?? engineMove?.maxpp ?? move.maxpp ?? pp;
+                            return {
+                                move: typeof move === "string" ? move : move.name || move.id || `Move ${idx + 1}`,
+                                id: normalizedMoveId,
+                                pp,
+                                maxpp,
+                                target: psMove?.target ?? engineMove?.target ?? move.target ?? "normal",
+                                disabled: psMove?.disabled ?? engineMove?.disabled ?? move.disabled ?? false,
+                            };
+                        }),
+                    }],
+            };
         sock.emit("promptAction", {
             roomId: room.id,
             playerId: player.id,
-            prompt: moveRequest,
+            prompt,
             state: state,
         });
+        room.lastPromptByPlayer[player.id] = {
+            turn,
+            type: promptType,
+            rqid: prompt.rqid,
+        };
     }
+    console.log(`[Server] emitMovePrompts turn=${turn}: prompted=${JSON.stringify(promptedPlayers)} skipped=${JSON.stringify(skippedPlayers)}`);
 }
 // Emit force-switch prompts to players who need to switch due to fainted Pokemon
 function emitForceSwitchPrompts(room, state, needsSwitch) {
+    console.log(`[Server] emitForceSwitchPrompts called for ${needsSwitch.length} players:`, needsSwitch);
     for (const playerId of needsSwitch) {
         const playerSocket = room.players.find(p => p.id === playerId)?.socketId;
-        if (!playerSocket)
+        if (!playerSocket) {
+            console.log(`[Server] emitForceSwitchPrompts: No socket found for player ${playerId}`);
             continue;
+        }
         const sock = io.sockets.sockets.get(playerSocket);
-        if (!sock)
+        if (!sock) {
+            console.log(`[Server] emitForceSwitchPrompts: Socket not connected for player ${playerId}`);
             continue;
+        }
         const player = state.players.find(p => p.id === playerId);
-        if (!player)
+        if (!player) {
+            console.log(`[Server] emitForceSwitchPrompts: Player not found in state for ${playerId}`);
             continue;
+        }
         // Get the PS engine's native request - it has correctly ordered pokemon array
         let psRequest = null;
         if (room.engine instanceof sync_ps_engine_1.default) {
             psRequest = room.engine.getRequest(playerId);
+            console.log(`[Server] emitForceSwitchPrompts: Got PS request for ${playerId}:`, JSON.stringify(psRequest?.forceSwitch));
         }
         const sideIndex = state.players.indexOf(player);
         const sideId = `p${sideIndex + 1}`;
@@ -581,6 +765,11 @@ function emitForceSwitchPrompts(room, state, needsSwitch) {
                     playerId: player.id,
                 },
             };
+            console.log(`[Server] emitForceSwitchPrompts: Emitting PS forceSwitch prompt to ${playerId}:`, {
+                roomId: room.id,
+                forceSwitch: switchRequest.forceSwitch,
+                sidePokemon: switchRequest.side?.pokemon?.length,
+            });
             sock.emit("promptAction", {
                 roomId: room.id,
                 playerId: player.id,
@@ -653,8 +842,10 @@ function launchChallenge(sourceRoom, challenge) {
     rooms.set(battleRoomId, battleRoom);
     ownerSocket.join(battleRoomId);
     targetSocket.join(battleRoomId);
-    battleRoom.players.push({ id: challenge.owner.playerId, username: challenge.owner.username, socketId: challenge.owner.socketId });
-    battleRoom.players.push({ id: challenge.target.playerId, username: challenge.target.username, socketId: challenge.target.socketId });
+    const ownerTrainerSprite = coerceTrainerSprite(challenge.owner.playerPayload?.trainerSprite ?? challenge.owner.playerPayload?.avatar ?? challenge.owner.trainerSprite);
+    const targetTrainerSprite = coerceTrainerSprite(challenge.target.playerPayload?.trainerSprite ?? challenge.target.playerPayload?.avatar ?? challenge.target.trainerSprite);
+    battleRoom.players.push({ id: challenge.owner.playerId, username: challenge.owner.username, socketId: challenge.owner.socketId, trainerSprite: ownerTrainerSprite });
+    battleRoom.players.push({ id: challenge.target.playerId, username: challenge.target.username, socketId: challenge.target.socketId, trainerSprite: targetTrainerSprite });
     const playersPayload = [
         sanitizePlayerPayload(challenge.owner.playerPayload, challenge.owner),
         sanitizePlayerPayload(challenge.target.playerPayload, challenge.target),
@@ -711,9 +902,15 @@ tryLoadExternalData();
 const rooms = new Map();
 rooms.set(DEFAULT_LOBBY_ID, createRoomRecord(DEFAULT_LOBBY_ID, DEFAULT_LOBBY_NAME));
 const FORCE_SWITCH_TIMEOUT_MS = Number(process.env.FORCE_SWITCH_TIMEOUT_MS || 45000);
-function computeNeedsSwitch(state) {
+function computeNeedsSwitch(state, engine) {
     const out = [];
     for (const pl of state.players) {
+        // First check if PS engine says this player needs a force switch
+        if (engine && engine.needsForceSwitch(pl.id)) {
+            out.push(pl.id);
+            continue;
+        }
+        // Fallback: check our state mirror
         const active = pl.team[pl.activeIndex];
         if (active.currentHP <= 0 && pl.team.some((m, idx) => idx !== pl.activeIndex && m.currentHP > 0)) {
             out.push(pl.id);
@@ -761,12 +958,158 @@ function clearForceSwitchTimer(room) {
     }
     room.forceSwitchDeadline = undefined;
 }
+// Turn timeout - disabled auto-fill, just log a warning
+// Set TURN_TIMEOUT_MS env var to customize (in milliseconds). Default is 60 seconds.
+const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 60000); // 60 seconds default
+function startTurnTimer(room) {
+    clearTurnTimer(room);
+    room.turnDeadline = Date.now() + TURN_TIMEOUT_MS;
+    room.turnTimer = setTimeout(() => {
+        if (!room.engine || room.phase === "force-switch" || room.phase === "team-preview")
+            return;
+        const state = room.engine.getState();
+        const expected = state.players.length;
+        const submitted = Object.keys(room.turnBuffer);
+        if (submitted.length >= expected)
+            return; // Already complete
+        // Log detailed info about who hasn't submitted - but DO NOT auto-fill
+        const missing = state.players.filter(p => !room.turnBuffer[p.id]).map(p => p.id);
+        console.warn(`[Server] Turn ${state.turn} timeout - still waiting for ${missing.length} players: ${missing.join(', ')}`);
+        console.warn(`[Server] Submitted: ${submitted.join(', ') || 'none'} | Missing: ${missing.join(', ')}`);
+        // DO NOT auto-fill moves - just continue waiting
+        // The battle will only progress when all players submit their actions
+        // Restart the timer to keep checking
+        startTurnTimer(room);
+    }, TURN_TIMEOUT_MS);
+}
+function clearTurnTimer(room) {
+    if (room.turnTimer) {
+        clearTimeout(room.turnTimer);
+        room.turnTimer = undefined;
+    }
+    room.turnDeadline = undefined;
+}
+// Helper to process turn when buffer is full - extracted from sendAction handler
+function processTurnWithBuffer(room) {
+    if (!room.engine)
+        return;
+    const state = room.engine.getState();
+    const actions = Object.values(room.turnBuffer);
+    room.turnBuffer = {};
+    clearTurnTimer(room);
+    // Filter to only battle actions (move/switch)
+    const battleActions = actions.filter((a) => a.type === "move" || a.type === "switch");
+    console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: a.moveId, targetPokemonId: a.targetPokemonId } : {}) }))));
+    let result = room.engine.processTurn(battleActions);
+    // Deduplicate switch lines (PS sends private + public copies after |split| markers)
+    if (Array.isArray(result.events)) {
+        result = { ...result, events: deduplicateSwitchLines(result.events) };
+    }
+    // Filter duplicate start/switch batches after start protocol has already been sent
+    if (room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
+        const hasActionLine = result.events.some((l) => l.startsWith("|move|") ||
+            l.startsWith("|cant|") ||
+            l.startsWith("|-damage|") ||
+            l.startsWith("|damage|") ||
+            l.startsWith("|-heal|") ||
+            l.startsWith("|heal|") ||
+            l.startsWith("|faint|") ||
+            l.startsWith("|-"));
+        if (!hasActionLine) {
+            result = { ...result, events: [], anim: [] };
+        }
+        else {
+            const initPrefixes = [
+                "|start",
+                "|teampreview",
+                "|clearpoke",
+                "|poke|",
+                "|player|",
+                "|teamsize|",
+                "|gen|",
+                "|tier|",
+                "|gametype|",
+                "|t:|",
+                "|split|",
+            ];
+            const filteredEvents = result.events.filter((line) => {
+                if (line === "|")
+                    return false;
+                return !initPrefixes.some((prefix) => line.startsWith(prefix));
+            });
+            result = { ...result, events: filteredEvents };
+        }
+    }
+    if (!room.startProtocolSent && Array.isArray(result.events) && result.events.some((l) => l.startsWith("|start"))) {
+        room.startProtocolSent = true;
+    }
+    room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
+    const needsSwitch = computeNeedsSwitch(result.state, room.engine instanceof sync_ps_engine_1.default ? room.engine : undefined);
+    console.log(`[Server] Turn ${result.state.turn} results: events=${result.events.length} needsSwitch=${needsSwitch.length} (${needsSwitch.join(', ')})`);
+    if (needsSwitch.length > 0) {
+        room.phase = "force-switch";
+        room.forceSwitchNeeded = new Set(needsSwitch);
+        io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
+        startForceSwitchTimer(room);
+        // Emit force-switch prompts to players who need to switch
+        emitForceSwitchPrompts(room, result.state, needsSwitch);
+    }
+    if (Array.isArray(result?.events)) {
+        const hasStart = result.events.some((l) => l === "|start" || l.startsWith("|start|"));
+        const hasTurn = result.events.some((l) => l.startsWith("|turn|"));
+        const sample = result.events.slice(0, 8);
+        console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=${result.events.length} start=${hasStart} turn=${hasTurn} sample=${JSON.stringify(sample)}`);
+    }
+    else {
+        console.log(`[DIAG-PROTOCOL] [server] battleUpdate events=none`);
+    }
+    io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
+    // Simple end detection: if any player's active mon is fainted and no healthy mons remain
+    const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));
+    if (sideDefeated) {
+        const winner = result.state.players.find(pl => pl.id !== sideDefeated.id)?.id;
+        const replayId = saveReplay(room);
+        io.to(room.id).emit("battleEnd", { winner, replayId });
+        clearForceSwitchTimer(room);
+        clearTurnTimer(room);
+    }
+    else if (needsSwitch.length === 0) {
+        // Emit new move prompts for the next turn
+        emitMovePrompts(room, result.state);
+    }
+}
 io.on("connection", (socket) => {
     let user = { id: socket.id, username: `Guest-${socket.id.slice(0, 4)}` };
     socket.on("identify", (data) => {
         if (data?.username)
             user.username = data.username;
-        socket.emit("identified", { id: user.id, username: user.username });
+        const nextTrainerSprite = coerceTrainerSprite(data?.trainerSprite ?? data?.avatar);
+        if (nextTrainerSprite)
+            user.trainerSprite = nextTrainerSprite;
+        const touchedRooms = [];
+        for (const room of rooms.values()) {
+            let touched = false;
+            const player = room.players.find((p) => p.socketId === socket.id);
+            if (player) {
+                player.username = user.username;
+                if (user.trainerSprite)
+                    player.trainerSprite = user.trainerSprite;
+                touched = true;
+            }
+            const spectator = room.spectators.find((s) => s.socketId === socket.id);
+            if (spectator) {
+                spectator.username = user.username;
+                if (user.trainerSprite)
+                    spectator.trainerSprite = user.trainerSprite;
+                touched = true;
+            }
+            if (touched)
+                touchedRooms.push(room);
+        }
+        socket.emit("identified", { id: user.id, username: user.username, trainerSprite: user.trainerSprite, avatar: user.trainerSprite });
+        for (const room of touchedRooms) {
+            broadcastRoomSummary(room);
+        }
     });
     socket.on("createRoom", (data) => {
         const requestedId = data?.id && typeof data.id === "string" ? data.id.trim() : "";
@@ -783,10 +1126,40 @@ io.on("connection", (socket) => {
             return socket.emit("error", { error: "room not found" });
         socket.join(room.id);
         if (data.role === "player") {
-            room.players.push({ id: user.id, username: user.username, socketId: socket.id });
+            // De-duplicate any stale entries for this user/socket
+            room.spectators = room.spectators.filter((s) => s.id !== user.id && s.socketId !== socket.id);
+            room.players = room.players.filter((p) => p.socketId !== socket.id || p.id === user.id);
+            const existingIndex = room.players.findIndex((p) => p.id === user.id);
+            if (existingIndex >= 0) {
+                room.players[existingIndex] = {
+                    ...room.players[existingIndex],
+                    id: user.id,
+                    username: user.username,
+                    socketId: socket.id,
+                    trainerSprite: user.trainerSprite,
+                };
+            }
+            else {
+                room.players.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
+            }
         }
         else {
-            room.spectators.push({ id: user.id, username: user.username, socketId: socket.id });
+            // De-duplicate any stale entries for this user/socket
+            room.players = room.players.filter((p) => p.id !== user.id && p.socketId !== socket.id);
+            room.spectators = room.spectators.filter((s) => s.socketId !== socket.id || s.id === user.id);
+            const existingIndex = room.spectators.findIndex((s) => s.id === user.id);
+            if (existingIndex >= 0) {
+                room.spectators[existingIndex] = {
+                    ...room.spectators[existingIndex],
+                    id: user.id,
+                    username: user.username,
+                    socketId: socket.id,
+                    trainerSprite: user.trainerSprite,
+                };
+            }
+            else {
+                room.spectators.push({ id: user.id, username: user.username, socketId: socket.id, trainerSprite: user.trainerSprite });
+            }
             // Send spectator snapshot if battle started
             if (room.battleStarted && room.engine) {
                 const state = room.engine.getState();
@@ -802,14 +1175,22 @@ io.on("connection", (socket) => {
             return socket.emit("error", { error: "room not found" });
         if (room.battleStarted)
             return;
-        const battleSeed = data.seed ?? 123;
+        const battleSeed = Number.isFinite(data.seed) ? data.seed : undefined;
         if (USE_PS_ENGINE) {
-            room.engine = new sync_ps_engine_1.default({ format: "gen9customgame", seed: battleSeed });
+            room.engine = new sync_ps_engine_1.default({ format: "gen9customgame", seed: battleSeed, rules: data.rules });
         }
         else {
             room.engine = new engine_1.default({ seed: battleSeed });
         }
-        const state = room.engine.initializeBattle(data.players, { seed: battleSeed });
+        const hydratedPlayers = data.players.map((player) => {
+            const clone = JSON.parse(JSON.stringify(player));
+            const roomPlayer = room.players.find((p) => p.id === player.id);
+            const trainerSprite = coerceTrainerSprite(clone.trainerSprite ?? clone.avatar ?? roomPlayer?.trainerSprite);
+            clone.trainerSprite = trainerSprite || undefined;
+            clone.avatar = trainerSprite || undefined;
+            return clone;
+        });
+        const state = room.engine.initializeBattle(hydratedPlayers, { seed: battleSeed });
         if (typeof state.turn === "number" && state.turn < 1) {
             state.turn = 1;
         }
@@ -818,18 +1199,25 @@ io.on("connection", (socket) => {
         room.forceSwitchNeeded = new Set();
         console.log(`[Server] Emitting battleStarted for room ${room.id} (startBattle socket)`);
         io.to(room.id).emit("battleStarted", { roomId: room.id, state });
-        const initialEvents = buildInitialBattleProtocol(state);
-        if (initialEvents.length > 0) {
-            if (Array.isArray(state.log)) {
-                for (const line of initialEvents) {
-                    if (!state.log.includes(line))
-                        state.log.push(line);
+        // Only verify/inject start events if the engine hasn't already done so
+        const hasStart = Array.isArray(state.log) && state.log.some((l) => l.startsWith("|start"));
+        if (hasStart)
+            room.startProtocolSent = true;
+        if (!hasStart) {
+            const initialEvents = buildInitialBattleProtocol(state);
+            if (initialEvents.length > 0) {
+                if (Array.isArray(state.log)) {
+                    for (const line of initialEvents) {
+                        if (!state.log.includes(line))
+                            state.log.push(line);
+                    }
                 }
+                room.startProtocolSent = true;
+                io.to(room.id).emit("battleUpdate", {
+                    result: { state, events: initialEvents, anim: [] },
+                    needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
+                });
             }
-            io.to(room.id).emit("battleUpdate", {
-                result: { state, events: initialEvents, anim: [] },
-                needsSwitch: Array.from(room.forceSwitchNeeded ?? []),
-            });
         }
         emitMovePrompts(room, state);
     });
@@ -838,9 +1226,20 @@ io.on("connection", (socket) => {
         if (!room)
             return socket.emit("error", { error: "room not found" });
         // Validate sender is a player in the room and matches playerId
-        const sender = room.players.find((p) => p.socketId === socket.id);
+        let sender = room.players.find((p) => p.socketId === socket.id);
         if (!sender || sender.id !== data.playerId) {
-            return socket.emit("error", { error: "not authorized for this action" });
+            const inRoom = socket.rooms.has(room.id);
+            const statePlayer = room.engine?.getState().players.find((p) => p.id === data.playerId);
+            if (inRoom && statePlayer) {
+                console.warn(`[Server] Recovering missing room player for ${data.playerId} (socket ${socket.id})`);
+                // Upsert player record so future prompts/actions have a live socket
+                room.players = room.players.filter((p) => p.id !== data.playerId && p.socketId !== socket.id);
+                room.players.push({ id: data.playerId, username: statePlayer.name || data.playerId, socketId: socket.id, trainerSprite: statePlayer.trainerSprite });
+                sender = room.players.find((p) => p.socketId === socket.id);
+            }
+            else {
+                return socket.emit("error", { error: "not authorized for this action" });
+            }
         }
         // Handle team preview phase
         if (room.phase === "team-preview") {
@@ -899,7 +1298,11 @@ io.on("connection", (socket) => {
                 }
             }
             // Perform immediate forced switch via engine
-            const res = room.engine.forceSwitch(data.playerId, data.action.toIndex);
+            let res = room.engine.forceSwitch(data.playerId, data.action.toIndex);
+            // Deduplicate switch lines (PS sends private + public copies)
+            if (Array.isArray(res.events)) {
+                res = { ...res, events: deduplicateSwitchLines(res.events) };
+            }
             room.replay.push({ turn: res.state.turn, events: res.events, anim: res.anim, phase: "force-switch" });
             room.forceSwitchNeeded.delete(data.playerId);
             {
@@ -931,29 +1334,38 @@ io.on("connection", (socket) => {
             }
         }
         // Convert moveIndex-based action to moveId-based action
-        // Client sends { type: 'move', moveIndex: 0 }, we need to convert to { type: 'move', moveId: '...', pokemonId: '...', ... }
+        // Client may send { type: 'move', moveId: '...', moveIndex: 0 }
         let processedAction = data.action;
-        if (data.action.type === "move" && typeof data.action.moveIndex === "number") {
+        if (data.action.type === "move") {
             const moveState = room.engine.getState();
             const movePlayer = moveState.players.find(p => p.id === data.playerId);
             if (movePlayer) {
                 const activePokemon = movePlayer.team[movePlayer.activeIndex];
+                const opponent = moveState.players.find(p => p.id !== data.playerId);
+                const opponentActive = opponent?.team[opponent.activeIndex];
+                const providedMoveId = data.action.moveId;
                 const moveIndex = data.action.moveIndex;
-                const move = activePokemon?.moves?.[moveIndex];
-                if (move) {
-                    const moveId = typeof move === 'string' ? move : (move.id || move.name);
-                    // Find opponent for target
-                    const opponent = moveState.players.find(p => p.id !== data.playerId);
-                    const opponentActive = opponent?.team[opponent.activeIndex];
+                const moveFromIndex = typeof moveIndex === "number" ? activePokemon?.moves?.[moveIndex] : undefined;
+                const resolvedMoveId = providedMoveId || (moveFromIndex ? (typeof moveFromIndex === 'string' ? moveFromIndex : (moveFromIndex.id || moveFromIndex.name)) : undefined);
+                if (resolvedMoveId) {
                     processedAction = {
                         type: "move",
                         actorPlayerId: data.playerId,
                         pokemonId: activePokemon.id,
-                        moveId: moveId,
+                        moveId: resolvedMoveId,
                         targetPlayerId: opponent?.id || "",
                         targetPokemonId: opponentActive?.id || "",
+                        mega: !!data.action.mega,
+                        zmove: !!data.action.zmove,
+                        dynamax: !!data.action.dynamax,
+                        terastallize: !!data.action.terastallize,
                     };
-                    console.log(`[Server] Converted moveIndex ${moveIndex} to moveId ${moveId}`);
+                    if (typeof moveIndex === "number") {
+                        console.log(`[Server] Converted moveIndex ${moveIndex} to moveId ${resolvedMoveId}`);
+                    }
+                    else {
+                        console.log(`[Server] Using provided moveId ${resolvedMoveId}`);
+                    }
                 }
             }
         }
@@ -978,41 +1390,25 @@ io.on("connection", (socket) => {
         console.log(`[Server] Action received from ${data.playerId}:`, JSON.stringify(processedAction));
         const currentState = room.engine.getState();
         const expected = currentState.players.length;
+        // Log disconnected players but DO NOT auto-fill their actions
+        const livePlayerIds = new Set(room.players.filter((p) => io.sockets.sockets.has(p.socketId)).map((p) => p.id));
+        const missingPlayers = currentState.players.filter((p) => !livePlayerIds.has(p.id));
+        if (missingPlayers.length > 0) {
+            console.warn(`[Server] Disconnected players: ${missingPlayers.map(p => p.id).join(', ')} - waiting for reconnection or timeout`);
+        }
         console.log(`[Server] Turn buffer size: ${Object.keys(room.turnBuffer).length}/${expected}`);
         if (Object.keys(room.turnBuffer).length >= expected) {
-            const actions = Object.values(room.turnBuffer);
-            room.turnBuffer = {};
-            // Filter to only battle actions (move/switch)
-            const battleActions = actions.filter((a) => a.type === "move" || a.type === "switch");
-            console.log('[Server] Processing turn with actions:', JSON.stringify(battleActions.map(a => ({ type: a.type, pokemonId: a.pokemonId, ...(a.type === 'move' ? { moveId: a.moveId, targetPokemonId: a.targetPokemonId } : {}) }))));
-            const result = room.engine.processTurn(battleActions);
-            room.replay.push({ turn: result.state.turn, events: result.events, anim: result.anim });
-            const needsSwitch = computeNeedsSwitch(result.state);
-            if (needsSwitch.length > 0) {
-                room.phase = "force-switch";
-                room.forceSwitchNeeded = new Set(needsSwitch);
-                io.to(room.id).emit("phase", { phase: room.phase, deadline: (room.forceSwitchDeadline = Date.now() + FORCE_SWITCH_TIMEOUT_MS) });
-                startForceSwitchTimer(room);
-                // Emit force-switch prompts to players who need to switch
-                emitForceSwitchPrompts(room, result.state, needsSwitch);
-            }
-            io.to(room.id).emit("battleUpdate", { result, needsSwitch, rooms: { trick: result.state.field.room, magic: result.state.field.magicRoom, wonder: result.state.field.wonderRoom } });
-            // Simple end detection: if any player's active mon is fainted and no healthy mons remain
-            const sideDefeated = result.state.players.find((pl) => pl.team.every(m => m.currentHP <= 0));
-            if (sideDefeated) {
-                const winner = result.state.players.find(pl => pl.id !== sideDefeated.id)?.id;
-                const replayId = saveReplay(room);
-                io.to(room.id).emit("battleEnd", { winner, replayId });
-                clearForceSwitchTimer(room);
-            }
-            else if (needsSwitch.length === 0) {
-                // Emit new move prompts for the next turn
-                emitMovePrompts(room, result.state);
-            }
+            processTurnWithBuffer(room);
         }
         else {
-            // prompt others that we're waiting
-            io.to(room.id).emit("promptAction", { waitingFor: expected - Object.keys(room.turnBuffer).length });
+            // Send "waiting" notification ONLY to the player who just submitted
+            // Not to all players - that would incorrectly put both in waiting state
+            socket.emit("promptAction", {
+                roomId: data.roomId,
+                playerId: data.playerId,
+                waitingFor: expected - Object.keys(room.turnBuffer).length,
+                prompt: { wait: true }
+            });
         }
     });
     socket.on("sendChat", (data) => {
@@ -1031,6 +1427,12 @@ io.on("connection", (socket) => {
         const rawId = typeof data?.challengeId === "string" ? data.challengeId.trim() : "";
         const challengeId = rawId && !room.challenges.has(rawId) ? rawId : (0, uuid_1.v4)().slice(0, 8);
         const targetPlayer = data?.toPlayerId ? room.players.find((p) => p.id === data.toPlayerId) : undefined;
+        const ownerPayload = data?.player ? JSON.parse(JSON.stringify(data.player)) : undefined;
+        const ownerTrainerSprite = coerceTrainerSprite(ownerPayload?.trainerSprite ?? ownerPayload?.avatar ?? user.trainerSprite);
+        if (ownerPayload && ownerTrainerSprite) {
+            ownerPayload.trainerSprite = ownerTrainerSprite;
+            ownerPayload.avatar = ownerTrainerSprite;
+        }
         const challenge = {
             id: challengeId,
             roomId: room.id,
@@ -1043,7 +1445,8 @@ io.on("connection", (socket) => {
                 username: user.username,
                 socketId: socket.id,
                 accepted: true,
-                playerPayload: data?.player ? JSON.parse(JSON.stringify(data.player)) : undefined,
+                trainerSprite: ownerTrainerSprite,
+                playerPayload: ownerPayload,
             },
             target: targetPlayer
                 ? {
@@ -1105,9 +1508,16 @@ io.on("connection", (socket) => {
         }
         if (!data?.player)
             return socket.emit("error", { error: "team payload required" });
+        const participantPayload = JSON.parse(JSON.stringify(data.player));
+        const participantTrainerSprite = coerceTrainerSprite(participantPayload?.trainerSprite ?? participantPayload?.avatar ?? user.trainerSprite);
+        if (participantTrainerSprite) {
+            participantPayload.trainerSprite = participantTrainerSprite;
+            participantPayload.avatar = participantTrainerSprite;
+        }
         participant.accepted = true;
         participant.username = user.username;
-        participant.playerPayload = JSON.parse(JSON.stringify(data.player));
+        participant.trainerSprite = participantTrainerSprite;
+        participant.playerPayload = participantPayload;
         if (challenge.owner.accepted && challenge.owner.playerPayload && challenge.target && challenge.target.accepted && challenge.target.playerPayload) {
             challenge.status = "launching";
             emitChallengeUpdated(room, challenge);
@@ -1149,7 +1559,7 @@ function summary(room) {
     return {
         id: room.id,
         name: room.name,
-        players: room.players.map((p) => ({ id: p.id, username: p.username })),
+        players: room.players.map((p) => ({ id: p.id, username: p.username, trainerSprite: p.trainerSprite, avatar: p.trainerSprite })),
         spectCount: room.spectators.length,
         battleStarted: room.battleStarted,
         challengeCount: room.challenges.size,

@@ -20,6 +20,7 @@ const USE_PS_ENGINE = process.env.USE_PS_ENGINE !== "false"; // Default to PS en
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const REPLAYS_DIR = path.join(DATA_DIR, "replays");
 const CUSTOM_DEX_FILE = path.join(DATA_DIR, "customdex.json");
+const CUSTOM_SPRITES_FILE = path.join(DATA_DIR, "customsprites.json");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(REPLAYS_DIR)) fs.mkdirSync(REPLAYS_DIR);
 
@@ -178,9 +179,13 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: "25mb" }));
 
 // --- Custom Dex persistence & helpers ---
+type SpriteSlot = "front" | "shiny" | "back" | "back-shiny";
+type CustomSpritesData = Record<string, Partial<Record<SpriteSlot, string>>>;
+type CustomSyncPayload = ExternalDexData & { sprites?: CustomSpritesData };
+
 function loadCustomDex(): ExternalDexData {
   try {
     if (fs.existsSync(CUSTOM_DEX_FILE)) {
@@ -195,6 +200,21 @@ function loadCustomDex(): ExternalDexData {
 function saveCustomDex(dex: ExternalDexData) {
   const payload = { species: dex.species ?? {}, moves: dex.moves ?? {} };
   fs.writeFileSync(CUSTOM_DEX_FILE, JSON.stringify(payload, null, 2));
+}
+
+function loadCustomSprites(): CustomSpritesData {
+  try {
+    if (fs.existsSync(CUSTOM_SPRITES_FILE)) {
+      const json = JSON.parse(fs.readFileSync(CUSTOM_SPRITES_FILE, "utf-8"));
+      return (json && typeof json === "object") ? json : {};
+    }
+  } catch {}
+  return {};
+}
+
+function saveCustomSprites(sprites: CustomSpritesData) {
+  const payload = sprites ?? {};
+  fs.writeFileSync(CUSTOM_SPRITES_FILE, JSON.stringify(payload, null, 2));
 }
 
 function diffDex(serverDex: ExternalDexData, clientDex: ExternalDexData) {
@@ -215,6 +235,33 @@ function diffDex(serverDex: ExternalDexData, clientDex: ExternalDexData) {
   }
   for (const [id, m] of Object.entries(clientDex.moves ?? {})) {
     if (!serverDex.moves || !serverDex.moves[id]) missingOnServer.moves[id] = m;
+  }
+
+  return { missingOnClient, missingOnServer };
+}
+
+function diffSprites(serverSprites: CustomSpritesData, clientSprites: CustomSpritesData) {
+  const missingOnClient: CustomSpritesData = {};
+  const missingOnServer: CustomSpritesData = {};
+
+  for (const [id, slots] of Object.entries(serverSprites || {})) {
+    for (const [slot, dataUrl] of Object.entries(slots || {})) {
+      if (!dataUrl) continue;
+      const existing = clientSprites?.[id]?.[slot as SpriteSlot];
+      if (!existing) {
+        missingOnClient[id] = { ...(missingOnClient[id] || {}), [slot]: dataUrl } as any;
+      }
+    }
+  }
+
+  for (const [id, slots] of Object.entries(clientSprites || {})) {
+    for (const [slot, dataUrl] of Object.entries(slots || {})) {
+      if (!dataUrl) continue;
+      const existing = serverSprites?.[id]?.[slot as SpriteSlot];
+      if (!existing) {
+        missingOnServer[id] = { ...(missingOnServer[id] || {}), [slot]: dataUrl } as any;
+      }
+    }
   }
 
   return { missingOnClient, missingOnServer };
@@ -242,18 +289,26 @@ app.get("/api/customdex", (_req: Request, res: Response) => {
 // 2) Sync: client posts its dex; server returns what client is missing (from server),
 //    and what server is missing (from client). Client may then call /upload to add to server.
 app.post("/api/customdex/sync", (req: Request, res: Response) => {
-  const clientDex = (req.body ?? {}) as ExternalDexData;
+  const clientDex = (req.body ?? {}) as CustomSyncPayload;
   const serverDex = loadCustomDex();
+  const serverSprites = loadCustomSprites();
+  const clientSprites = clientDex.sprites || {};
   const { missingOnClient, missingOnServer } = diffDex(serverDex, clientDex);
-  res.json({ missingOnClient, missingOnServer });
+  const spriteDiff = diffSprites(serverSprites, clientSprites);
+  res.json({
+    missingOnClient: { ...missingOnClient, sprites: spriteDiff.missingOnClient },
+    missingOnServer: { ...missingOnServer, sprites: spriteDiff.missingOnServer },
+  });
 });
 
 // 3) Upload: merge new entries from client into server store (no overwrite by default)
 app.post("/api/customdex/upload", (req: Request, res: Response) => {
-  const incoming = (req.body ?? {}) as ExternalDexData;
+  const incoming = (req.body ?? {}) as CustomSyncPayload;
   const serverDex = loadCustomDex();
+  const serverSprites = loadCustomSprites();
   let addedSpecies = 0;
   let addedMoves = 0;
+  let addedSprites = 0;
   serverDex.species = serverDex.species || {};
   serverDex.moves = serverDex.moves || {};
   for (const [id, s] of Object.entries(incoming.species ?? {})) {
@@ -268,8 +323,20 @@ app.post("/api/customdex/upload", (req: Request, res: Response) => {
       addedMoves++;
     }
   }
+  for (const [id, slots] of Object.entries(incoming.sprites || {})) {
+    const slotMap = slots as Record<string, string>;
+    for (const [slot, dataUrl] of Object.entries(slotMap || {})) {
+      if (!dataUrl) continue;
+      const existing = serverSprites?.[id]?.[slot as SpriteSlot];
+      if (!existing) {
+        serverSprites[id] = { ...(serverSprites[id] || {}), [slot]: dataUrl } as any;
+        addedSprites++;
+      }
+    }
+  }
   saveCustomDex(serverDex);
-  res.json({ ok: true, added: { species: addedSpecies, moves: addedMoves } });
+  saveCustomSprites(serverSprites);
+  res.json({ ok: true, added: { species: addedSpecies, moves: addedMoves, sprites: addedSprites } });
 });
 
 app.get("/api/rooms/:id", (req: Request, res: Response) => {

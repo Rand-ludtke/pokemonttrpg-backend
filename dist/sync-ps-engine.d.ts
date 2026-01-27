@@ -56,9 +56,13 @@ export declare class SyncPSEngine {
     private playerIdToSide;
     private sideToPlayerId;
     private format;
+    private lastLogIndex;
+    private startSent;
+    private rules?;
     constructor(options?: {
         format?: string;
         seed?: number | number[];
+        rules?: any;
     } | undefined);
     /**
      * Initialize a battle with the given players.
@@ -76,6 +80,18 @@ export declare class SyncPSEngine {
      */
     getRequest(playerId: string): PSRequest | null;
     /**
+     * Get the active Pokemon's moves with current PP directly from PS engine
+     * This is useful as a fallback when activeRequest is not available
+     */
+    getActiveMovesPP(playerId: string): Array<{
+        id: string;
+        name: string;
+        pp: number;
+        maxpp: number;
+        target: string;
+        disabled: boolean;
+    }> | null;
+    /**
      * Check if a player needs to make a force switch
      */
     needsForceSwitch(playerId: string): boolean;
@@ -88,7 +104,16 @@ export declare class SyncPSEngine {
      */
     processTurn(actions: BattleAction[]): TurnResult;
     /**
+     * Check if the unlimited terastallization clause is enabled
+     */
+    private hasUnlimitedTeraClause;
+    /**
+     * Re-enable canTerastallize for all Pokemon (for unlimited tera clause)
+     */
+    private resetTerastallizeForAll;
+    /**
      * Collect new log entries from PS battle
+     * Filters out duplicate |start| blocks that PS may generate
      */
     private collectNewLogEntries;
     /**

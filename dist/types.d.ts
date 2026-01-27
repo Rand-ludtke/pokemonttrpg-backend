@@ -41,6 +41,12 @@ export interface Pokemon {
     volatile: Record<string, any>;
     ability?: string;
     item?: string;
+    shiny?: boolean;
+    teraType?: string;
+    nature?: string;
+    evs?: Partial<Record<"hp" | "atk" | "def" | "spa" | "spd" | "spe", number>>;
+    ivs?: Partial<Record<"hp" | "atk" | "def" | "spa" | "spd" | "spe", number>>;
+    gender?: "M" | "F" | "N";
     moves: Move[];
 }
 export interface Player {
@@ -73,6 +79,10 @@ export interface MoveAction extends ActionBase {
     moveId: string;
     targetPlayerId: string;
     targetPokemonId: string;
+    mega?: boolean;
+    zmove?: boolean;
+    dynamax?: boolean;
+    terastallize?: boolean;
 }
 export interface SwitchAction extends ActionBase {
     type: "switch";

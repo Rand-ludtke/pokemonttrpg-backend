@@ -42,6 +42,10 @@ class PSEngine {
         // Convert our teams to PS packed format
         const p1Team = this.convertTeamToPacked(players[0].team);
         const p2Team = this.convertTeamToPacked(players[1].team);
+        // Extract avatar/trainerSprite for PS protocol
+        // IMPORTANT: Default to 'acetrainer' not empty string - PS client calls rollTrainerSprites() if avatar is falsy
+        const p1Avatar = players[0].trainerSprite || players[0].avatar || "acetrainer";
+        const p2Avatar = players[1].trainerSprite || players[1].avatar || "acetrainer";
         this.battle = {
             stream,
             omniscient,
@@ -79,8 +83,8 @@ class PSEngine {
         // Start the battle
         const spec = { formatid: format, seed };
         await omniscient.write(`>start ${JSON.stringify(spec)}`);
-        await omniscient.write(`>player p1 ${JSON.stringify({ name: players[0].name, team: p1Team })}`);
-        await omniscient.write(`>player p2 ${JSON.stringify({ name: players[1].name, team: p2Team })}`);
+        await omniscient.write(`>player p1 ${JSON.stringify({ name: players[0].name, avatar: p1Avatar, team: p1Team })}`);
+        await omniscient.write(`>player p2 ${JSON.stringify({ name: players[1].name, avatar: p2Avatar, team: p2Team })}`);
         // Wait for initial requests
         await this.waitForRequests();
         return this.state;
@@ -95,13 +99,13 @@ class PSEngine {
             item: mon.item || "",
             ability: mon.ability || "",
             moves: mon.moves.map((m) => m.name || m.id),
-            nature: "Hardy", // Default nature
-            evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
-            ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+            nature: mon.nature || "Hardy",
+            evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0, ...mon.evs },
+            ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31, ...mon.ivs },
             level: mon.level,
-            shiny: false,
-            gender: "",
-            teraType: "",
+            shiny: !!mon.shiny,
+            gender: mon.gender || "",
+            teraType: mon.teraType || "",
         }));
         return Teams.pack(sets);
     }
@@ -398,7 +402,16 @@ class PSEngine {
             // Find move index (1-based)
             const moveIndex = this.findMoveIndex(moveAction.moveId, request || null);
             if (moveIndex > 0) {
-                return `move ${moveIndex}`;
+                let choice = `move ${moveIndex}`;
+                if (moveAction.mega)
+                    choice += " mega";
+                if (moveAction.zmove)
+                    choice += " zmove";
+                if (moveAction.dynamax)
+                    choice += " dynamax";
+                if (moveAction.terastallize)
+                    choice += " terastallize";
+                return choice;
             }
             // Fallback to move 1
             return "move 1";
