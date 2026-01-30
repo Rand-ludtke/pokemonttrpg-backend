@@ -1399,6 +1399,21 @@ io.on("connection", (socket: Socket) => {
     const room = rooms.get(data.roomId);
     if (!room) return socket.emit("error", { error: "room not found" });
     
+    // Handle cancel action - clear the player's buffered action
+    if ((data.action as any).type === "cancel") {
+      if (room.turnBuffer[data.playerId]) {
+        delete room.turnBuffer[data.playerId];
+        console.log(`[Server] Action cancelled by ${data.playerId}`);
+        socket.emit("actionCancelled", { playerId: data.playerId, roomId: data.roomId });
+        // Re-send move prompt to this player
+        if (room.engine) {
+          const state = room.engine.getState();
+          emitMovePrompts(room, state);
+        }
+      }
+      return;
+    }
+    
     // Validate sender is a player in the room and matches playerId
     let sender = room.players.find((p) => p.socketId === socket.id);
     if (!sender || sender.id !== data.playerId) {
