@@ -12,6 +12,7 @@ import { mergeAbilities } from "../data/abilities";
 import { mergeItems } from "../data/items";
 import { convertShowdownAbilities, convertShowdownItems } from "../data/converters/showdown-converter";
 import { convertShowdownSpecies, convertShowdownMoves } from "../data/converters/showdown-species-moves";
+import { attachFusionWebSocket, registerFusionRoutes } from "./fusion-sync";
 
 // Configuration: Use Pokemon Showdown engine (true) or custom engine (false)
 const USE_PS_ENGINE = process.env.USE_PS_ENGINE !== "false"; // Default to PS engine
@@ -30,6 +31,30 @@ export interface ClientInfo {
   trainerSprite?: string;
 }
 
+export type MapToken = {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  size?: number;
+  color?: string;
+  sprite?: string;
+  ownerId?: string;
+};
+
+export type MapState = {
+  width: number;
+  height: number;
+  gridSize: number;
+  gridColor: string;
+  gridOpacity: number;
+  showGrid: boolean;
+  showLabels: boolean;
+  lockTokens: boolean;
+  background?: string;
+  tokens: MapToken[];
+};
+
 // Union type for either engine
 type BattleEngine = Engine | SyncPSEngine;
 
@@ -38,6 +63,9 @@ export interface Room {
   name: string;
   players: { id: string; username: string; socketId: string; trainerSprite?: string }[];
   spectators: { id: string; username: string; socketId: string; trainerSprite?: string }[];
+  roomType?: "battle" | "map";
+  mapState?: MapState;
+  mapOwnerId?: string;
   engine?: BattleEngine;
   battleStarted: boolean;
   startProtocolSent?: boolean;
@@ -95,10 +123,27 @@ interface ChallengeSummary {
 const DEFAULT_LOBBY_ID = "global-lobby";
 const DEFAULT_LOBBY_NAME = "Global Lobby";
 
-function createRoomRecord(id: string, name: string): Room {
+function createDefaultMapState(): MapState {
+  return {
+    width: 960,
+    height: 640,
+    gridSize: 32,
+    gridColor: "#5a5a5a",
+    gridOpacity: 0.35,
+    showGrid: true,
+    showLabels: true,
+    lockTokens: false,
+    background: "",
+    tokens: [],
+  };
+}
+
+function createRoomRecord(id: string, name: string, roomType: "battle" | "map" = "battle"): Room {
   return {
     id,
     name,
+    roomType,
+    mapState: roomType === "map" ? createDefaultMapState() : undefined,
     players: [],
     spectators: [],
     engine: undefined,
@@ -118,6 +163,25 @@ function createRoomRecord(id: string, name: string): Room {
     challenges: new Map(),
     lastPromptByPlayer: {},
   };
+}
+
+function ensureMapToken(room: Room, user: ClientInfo) {
+  if (room.roomType !== "map" || !room.mapState) return;
+  const exists = room.mapState.tokens.find(t => t.ownerId === user.id);
+  if (exists) return;
+  const base = room.mapState.tokens.length;
+  const size = 32;
+  const spacing = room.mapState.gridSize || 32;
+  const x = 32 + (base % 6) * (spacing + 4);
+  const y = 32 + Math.floor(base / 6) * (spacing + 4);
+  room.mapState.tokens.push({
+    id: user.id,
+    name: user.username,
+    x,
+    y,
+    size,
+    ownerId: user.id,
+  });
 }
 
 function challengeSummary(ch: Challenge): ChallengeSummary {
@@ -181,6 +245,24 @@ app.use((_req, res, next) => {
 
 app.use(express.json({ limit: "25mb" }));
 
+// --- Fusion sprites (Infinite Fusion) ---
+const FUSION_SPRITES_DIR = process.env.FUSION_SPRITES_DIR
+  ? path.resolve(process.env.FUSION_SPRITES_DIR)
+  : "";
+const FUSION_PACK_ZIP = process.env.FUSION_PACK_ZIP
+  ? path.resolve(process.env.FUSION_PACK_ZIP)
+  : "";
+
+if (FUSION_SPRITES_DIR && fs.existsSync(FUSION_SPRITES_DIR)) {
+  registerFusionRoutes(app, {
+    spritesDir: FUSION_SPRITES_DIR,
+    packZipPath: FUSION_PACK_ZIP || undefined,
+  });
+  console.log(`[Fusion] Sprites directory enabled: ${FUSION_SPRITES_DIR}`);
+} else {
+  console.log("[Fusion] Sprites directory not configured. Set FUSION_SPRITES_DIR to enable.");
+}
+
 // --- Custom Dex persistence & helpers ---
 type SpriteSlot = "front" | "shiny" | "back" | "back-shiny";
 type CustomSpritesData = Record<string, Partial<Record<SpriteSlot, string>>>;
@@ -191,14 +273,14 @@ function loadCustomDex(): ExternalDexData {
     if (fs.existsSync(CUSTOM_DEX_FILE)) {
       const json = JSON.parse(fs.readFileSync(CUSTOM_DEX_FILE, "utf-8"));
       // Ensure shape
-      return { species: json.species ?? {}, moves: json.moves ?? {} } as ExternalDexData;
+      return { species: json.species ?? {}, moves: json.moves ?? {}, abilities: json.abilities ?? {} } as ExternalDexData;
     }
   } catch {}
-  return { species: {}, moves: {} };
+  return { species: {}, moves: {}, abilities: {} };
 }
 
 function saveCustomDex(dex: ExternalDexData) {
-  const payload = { species: dex.species ?? {}, moves: dex.moves ?? {} };
+  const payload = { species: dex.species ?? {}, moves: dex.moves ?? {}, abilities: dex.abilities ?? {} };
   fs.writeFileSync(CUSTOM_DEX_FILE, JSON.stringify(payload, null, 2));
 }
 
@@ -218,8 +300,8 @@ function saveCustomSprites(sprites: CustomSpritesData) {
 }
 
 function diffDex(serverDex: ExternalDexData, clientDex: ExternalDexData) {
-  const missingOnClient = { species: {} as Record<string, any>, moves: {} as Record<string, any> };
-  const missingOnServer = { species: {} as Record<string, any>, moves: {} as Record<string, any> };
+  const missingOnClient = { species: {} as Record<string, any>, moves: {} as Record<string, any>, abilities: {} as Record<string, any> };
+  const missingOnServer = { species: {} as Record<string, any>, moves: {} as Record<string, any>, abilities: {} as Record<string, any> };
 
   // Server -> Client (what client lacks)
   for (const [id, s] of Object.entries(serverDex.species ?? {})) {
@@ -228,6 +310,9 @@ function diffDex(serverDex: ExternalDexData, clientDex: ExternalDexData) {
   for (const [id, m] of Object.entries(serverDex.moves ?? {})) {
     if (!clientDex.moves || !clientDex.moves[id]) missingOnClient.moves[id] = m;
   }
+  for (const [id, a] of Object.entries(serverDex.abilities ?? {})) {
+    if (!clientDex.abilities || !clientDex.abilities[id]) missingOnClient.abilities[id] = a;
+  }
 
   // Client -> Server (what server lacks)
   for (const [id, s] of Object.entries(clientDex.species ?? {})) {
@@ -235,6 +320,9 @@ function diffDex(serverDex: ExternalDexData, clientDex: ExternalDexData) {
   }
   for (const [id, m] of Object.entries(clientDex.moves ?? {})) {
     if (!serverDex.moves || !serverDex.moves[id]) missingOnServer.moves[id] = m;
+  }
+  for (const [id, a] of Object.entries(clientDex.abilities ?? {})) {
+    if (!serverDex.abilities || !serverDex.abilities[id]) missingOnServer.abilities[id] = a;
   }
 
   return { missingOnClient, missingOnServer };
@@ -308,9 +396,11 @@ app.post("/api/customdex/upload", (req: Request, res: Response) => {
   const serverSprites = loadCustomSprites();
   let addedSpecies = 0;
   let addedMoves = 0;
+  let addedAbilities = 0;
   let addedSprites = 0;
   serverDex.species = serverDex.species || {};
   serverDex.moves = serverDex.moves || {};
+  serverDex.abilities = serverDex.abilities || {};
   for (const [id, s] of Object.entries(incoming.species ?? {})) {
     if (!serverDex.species[id]) {
       serverDex.species[id] = s as any;
@@ -321,6 +411,12 @@ app.post("/api/customdex/upload", (req: Request, res: Response) => {
     if (!serverDex.moves[id]) {
       serverDex.moves[id] = m as any;
       addedMoves++;
+    }
+  }
+  for (const [id, a] of Object.entries(incoming.abilities ?? {})) {
+    if (!serverDex.abilities[id]) {
+      serverDex.abilities[id] = a as any;
+      addedAbilities++;
     }
   }
   for (const [id, slots] of Object.entries(incoming.sprites || {})) {
@@ -336,7 +432,7 @@ app.post("/api/customdex/upload", (req: Request, res: Response) => {
   }
   saveCustomDex(serverDex);
   saveCustomSprites(serverSprites);
-  res.json({ ok: true, added: { species: addedSpecies, moves: addedMoves, sprites: addedSprites } });
+  res.json({ ok: true, added: { species: addedSpecies, moves: addedMoves, abilities: addedAbilities, sprites: addedSprites } });
 });
 
 app.get("/api/rooms/:id", (req: Request, res: Response) => {
@@ -380,6 +476,14 @@ app.get("/api/rooms/:id/snapshot", (req: Request, res: Response) => {
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+if (FUSION_SPRITES_DIR && fs.existsSync(FUSION_SPRITES_DIR)) {
+  attachFusionWebSocket(server, {
+    spritesDir: FUSION_SPRITES_DIR,
+    packZipPath: FUSION_PACK_ZIP || undefined,
+  });
+  console.log("[Fusion] WebSocket endpoint enabled at /fusion-sync");
+}
 
 process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err?.stack || err);
@@ -1286,14 +1390,23 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  socket.on("createRoom", (data: { name?: string; id?: string }) => {
+  socket.on("createRoom", (data: { name?: string; id?: string; roomType?: "battle" | "map" }) => {
     const requestedId = data?.id && typeof data.id === "string" ? data.id.trim() : "";
     const id = requestedId && !rooms.has(requestedId) ? requestedId : uuidv4().slice(0, 8);
-    const room = createRoomRecord(id, data?.name || `Room ${id}`);
+    const roomType = data?.roomType === "map" ? "map" : "battle";
+    const room = createRoomRecord(id, data?.name || `Room ${id}`, roomType);
+    if (roomType === "map") {
+      room.mapOwnerId = user.id;
+      ensureMapToken(room, user);
+    }
     rooms.set(id, room);
     socket.join(id);
-    socket.emit("roomCreated", { id, name: room.name });
+    socket.emit("roomCreated", { id, name: room.name, roomType: room.roomType });
     io.emit("roomUpdate", summary(room));
+    if (room.roomType === "map") {
+      socket.emit("mapState", { roomId: room.id, state: room.mapState });
+      io.to(room.id).emit("mapState", { roomId: room.id, state: room.mapState });
+    }
   });
 
   socket.on("joinRoom", (data: { roomId: string; role: "player" | "spectator" }) => {
@@ -1338,8 +1451,40 @@ io.on("connection", (socket: Socket) => {
   socket.emit("spectate_start", { state, replay: room.replay, phase: room.phase ?? "normal", needsSwitch: Array.from(room.forceSwitchNeeded ?? []), deadline: room.forceSwitchDeadline ?? null, rooms: { trick: state.field.room, magic: state.field.magicRoom, wonder: state.field.wonderRoom } });
       }
     }
+    if (room.roomType === "map" && room.mapState) {
+      if (data.role === "player") ensureMapToken(room, user);
+      socket.emit("mapState", { roomId: room.id, state: room.mapState });
+      io.to(room.id).emit("mapState", { roomId: room.id, state: room.mapState });
+    }
     io.emit("roomUpdate", summary(room));
     socket.emit("challengeSync", { roomId: room.id, challenges: challengeSummaries(room) });
+  });
+
+  socket.on("mapUpdate", (data: { roomId: string; state?: Partial<MapState> }) => {
+    const room = rooms.get(data?.roomId);
+    if (!room || room.roomType !== "map" || !room.mapState) return;
+    if (room.mapOwnerId && room.mapOwnerId !== user.id) return;
+    const incoming = data?.state || {};
+    room.mapState = {
+      ...room.mapState,
+      ...incoming,
+      tokens: Array.isArray(incoming.tokens) ? incoming.tokens : room.mapState.tokens,
+    };
+    io.to(room.id).emit("mapState", { roomId: room.id, state: room.mapState });
+  });
+
+  socket.on("mapTokenMove", (data: { roomId: string; tokenId: string; x: number; y: number }) => {
+    const room = rooms.get(data?.roomId);
+    if (!room || room.roomType !== "map" || !room.mapState) return;
+    const token = room.mapState.tokens.find(t => t.id === data.tokenId);
+    if (!token) return;
+    if (room.mapState.lockTokens && room.mapOwnerId !== user.id) return;
+    if (token.ownerId && token.ownerId !== user.id && room.mapOwnerId !== user.id) return;
+    const width = room.mapState.width || 960;
+    const height = room.mapState.height || 640;
+    token.x = Math.max(0, Math.min(width, Number(data.x) || 0));
+    token.y = Math.max(0, Math.min(height, Number(data.y) || 0));
+    io.to(room.id).emit("mapState", { roomId: room.id, state: room.mapState });
   });
 
   socket.on("startBattle", (data: { roomId: string; players: Player[]; seed?: number; rules?: any }) => {
@@ -1757,6 +1902,8 @@ function summary(room: Room) {
   return {
     id: room.id,
     name: room.name,
+    roomType: room.roomType ?? "battle",
+    mapOwnerId: room.mapOwnerId,
     players: room.players.map((p) => ({ id: p.id, username: p.username, trainerSprite: p.trainerSprite, avatar: p.trainerSprite })),
     spectCount: room.spectators.length,
     battleStarted: room.battleStarted,

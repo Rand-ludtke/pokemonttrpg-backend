@@ -12,6 +12,13 @@ export interface ExternalMove {
   priority?: number;
 }
 
+export interface ExternalAbility {
+  id: string;
+  name: string;
+  desc?: string;
+  shortDesc?: string;
+}
+
 export interface ExternalSpecies {
   id: string;
   name: string;
@@ -24,6 +31,7 @@ export interface ExternalSpecies {
 export interface ExternalDexData {
   species: Record<string, ExternalSpecies>;
   moves: Record<string, ExternalMove>;
+  abilities?: Record<string, ExternalAbility>;
 }
 
 export interface ExternalTeamPokemon {
